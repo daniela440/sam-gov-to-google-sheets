@@ -1,6 +1,8 @@
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+import os
+import json
 
 # ===== CONFIG =====
 SAM_API_KEY = "PASTE_YOUR_SAM_API_KEY_HERE"
@@ -12,8 +14,10 @@ scopes = [
     "https://www.googleapis.com/auth/drive"
 ]
 
-creds = Credentials.from_service_account_file(
-    "google_credentials.json",
+creds_info = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
+
+creds = Credentials.from_service_account_info(
+    creds_info,
     scopes=scopes
 )
 
