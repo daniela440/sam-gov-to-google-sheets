@@ -22,7 +22,9 @@ creds = Credentials.from_service_account_info(
 )
 
 client = gspread.authorize(creds)
-sheet = client.open(SPREADSHEET_NAME).sheet1
+SPREADSHEET_ID = "1hxriYRXl9RwiS5VTTVkvIeroPUDQO-CDeYEH_8SWrBY"
+
+sheet = client.open_by_key(SPREADSHEET_ID).sheet1
 
 # ===== SAM.GOV REQUEST =====
 url = "https://api.sam.gov/prod/opportunities/v2/search"
