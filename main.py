@@ -5,7 +5,7 @@ import os
 import json
 
 # ===== CONFIG =====
-SAM_API_KEY = os.environ["SAM_API_KEY"]
+SAM_API_KEY = "SAM-7f9ae9a8-1f25-42bd-a52c-295ffff7934b"
 SPREADSHEET_NAME = "SAM – Awarded Bids – Auto Import"
 
 # ===== GOOGLE AUTH =====
