@@ -48,20 +48,33 @@ if existing_header != header:
 
 
 # =============================
-# SAM.GOV REQUEST
+# SAM.GOV REQUEST (v2 requires postedFrom/postedTo)
 # =============================
-url = "https://api.sam.gov/prod/opportunities/v2/search"
+from datetime import datetime, timedelta
+
+# Use the documented production endpoint
+url = "https://api.sam.gov/opportunities/v2/search"
+
+# Pull awards posted in the last 30 days (you can change 30 to 7, 14, 60, etc.)
+today = datetime.utcnow().date()
+posted_to = today.strftime("%m/%d/%Y")
+posted_from = (today - timedelta(days=30)).strftime("%m/%d/%Y")
+
 params = {
     "api_key": SAM_API_KEY,
-    "notice_type": "award",
+    "ptype": "a",              # a = Award Notice
+    "postedFrom": posted_from, # REQUIRED
+    "postedTo": posted_to,     # REQUIRED
     "limit": LIMIT,
+    "offset": 0,
 }
 
 response = requests.get(url, params=params, timeout=60)
 response.raise_for_status()
 data = response.json()
 
-items = data.get("opportunitiesData", []) or []
+# Different responses have used different top-level keys over time; handle both.
+items = data.get("opportunitiesData") or data.get("data") or []
 
 
 def build_address(addr: dict) -> str:
@@ -78,38 +91,36 @@ def build_address(addr: dict) -> str:
 
 rows = []
 
+rows = []
+
+def join_parts(parts):
+    return ", ".join([p for p in parts if p])
+
 for item in items:
-    award = item.get("award", {}) or {}
+    # Many responses wrap details under "data"
+    d = item.get("data", item)
+
+    award = d.get("award", {}) or {}
     awardee = award.get("awardee", {}) or {}
 
-    company = (
-        awardee.get("name")
-        or item.get("awardeeName")
-        or item.get("organizationName")
-        or ""
-    )
+    company = awardee.get("name") or ""
+    website = awardee.get("website") or ""
+    phone = awardee.get("phone") or ""
 
-    website = awardee.get("website", "") or ""
-    phone = awardee.get("phone", "") or ""
+    loc = awardee.get("location", {}) or {}
+    address = join_parts([
+        loc.get("streetAddress"),
+        loc.get("streetAddress2"),
+        loc.get("city", {}).get("name") if isinstance(loc.get("city"), dict) else loc.get("city"),
+        loc.get("state", {}).get("name") if isinstance(loc.get("state"), dict) else loc.get("state"),
+        loc.get("zip"),
+        loc.get("country", {}).get("name") if isinstance(loc.get("country"), dict) else loc.get("country"),
+    ])
 
-    address_data = awardee.get("address", {}) or {}
-    address = build_address(address_data)
-
-    classification = item.get("classification", {}) or {}
-    naics = ""
-
-    if isinstance(classification.get("naics"), str):
-        naics = classification.get("naics")
-    elif isinstance(classification.get("naics"), list) and classification.get("naics"):
-        first = classification["naics"][0]
-        if isinstance(first, dict):
-            naics = first.get("code", "") or first.get("naicsCode", "")
-        elif isinstance(first, str):
-            naics = first
+    naics = item.get("naicsCode") or d.get("naicsCode") or ""
 
     if any([company, website, address, phone, naics]):
         rows.append([company, website, address, phone, naics])
-
 
 if rows:
     sheet.append_rows(rows, value_input_option="RAW")
