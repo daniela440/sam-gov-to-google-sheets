@@ -18,7 +18,7 @@ GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 NAICS_CODES = {"238210", "236220", "237310", "238220", "238120"}
 
 DAYS_BACK = 30
-LIMIT = 100  # one call; keep modest. If needed, we can paginate later.
+LIMIT = 25  # one call; keep modest. If needed, we can paginate later.
 
 ENTITY_LOOKUP_DELAY_SECONDS = 1.2  # slower to avoid rate limits
 
@@ -60,16 +60,21 @@ def join_parts(parts):
     return ", ".join(parts)
 
 
-def sam_get(url, params, retries=8, base_sleep=5):
+def sam_get(url, params, retries=12, base_sleep=15):
     """
-    Handles SAM.gov 429 by respecting Retry-After when present.
-    Uses exponential backoff.
+    Robust SAM.gov GET with long retry for 429 and graceful handling.
+    - retries=12 with base_sleep=15 can wait ~ (15+30+60+120+...) up to ~1 hour worst case.
+    - If still blocked, we return None instead of crashing.
     """
+    last_response = None
+
     for attempt in range(retries):
         r = requests.get(url, params=params, timeout=60)
+        last_response = r
 
         if r.status_code == 429:
             retry_after = r.headers.get("Retry-After")
+
             if retry_after:
                 try:
                     wait = int(retry_after)
@@ -78,14 +83,28 @@ def sam_get(url, params, retries=8, base_sleep=5):
             else:
                 wait = base_sleep * (2 ** attempt)
 
+            # Cap the wait so it doesn't explode forever
+            wait = min(wait, 600)  # max 10 minutes between tries
+            print(f"SAM rate-limited (429). Waiting {wait}s then retrying... (attempt {attempt+1}/{retries})")
             time.sleep(wait)
             continue
 
-        r.raise_for_status()
+        if r.status_code >= 400:
+            print(f"SAM request failed: {r.status_code} {r.text[:200]}")
+            r.raise_for_status()
+
         return r
 
-    r.raise_for_status()
-    return r
+    # If we exhausted retries, do NOT crash the workflow—just return None
+    if last_response is not None and last_response.status_code == 429:
+        print("Still rate-limited after retries. Exiting gracefully (no rows appended this run).")
+        return None
+
+    # Otherwise raise the last error
+    if last_response is not None:
+        last_response.raise_for_status()
+    return None
+
 
 
 def fetch_awards_once():
@@ -109,6 +128,9 @@ def fetch_awards_once():
     }
 
     r = sam_get(url, params)
+    if r is None:
+        return []
+
     data = r.json()
     return data.get("opportunitiesData") or []
 
