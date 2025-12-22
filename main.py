@@ -1,272 +1,172 @@
 import os
 import json
 import time
-from datetime import datetime, timedelta
+import re
+from urllib.parse import urlparse
 
 import requests
+from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
 
 
-# =============================
-# CONFIG
-# =============================
-SAM_API_KEY = os.environ["SAM_API_KEY"]
+# ====== CONFIG (from GitHub Secrets) ======
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
+SHEET_TAB_NAME = os.environ.get("SHEET_TAB_NAME", "USASpending Construction")
+
+# How many rows to process per run (safe batch size)
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "50"))
+
+# Polite pacing between searches (seconds)
+SLEEP_SECONDS = float(os.environ.get("SLEEP_SECONDS", "2.5"))
+
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
-NAICS_CODES = {"238210", "236220", "237310", "238220", "238120"}
 
-DAYS_BACK = 30
-LIMIT = 25  # one call; keep modest. If needed, we can paginate later.
-
-ENTITY_LOOKUP_DELAY_SECONDS = 1.2  # slower to avoid rate limits
-
-
-# =============================
-# GOOGLE SHEETS AUTH
-# =============================
-scopes = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-
-creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
-creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
-client = gspread.authorize(creds)
-sheet = client.open_by_key(SPREADSHEET_ID).sheet1
-
-
-def ensure_header():
-    a1 = sheet.acell("A1").value
-    if not a1 or str(a1).strip() == "":
-        sheet.update(
-            "A1:E1",
-            [["Company Name", "Website", "Physical Address", "Phone Number", "NAICS Code"]],
-        )
+# Domains we do NOT want as "official websites"
+BLOCKED_DOMAINS = {
+    "facebook.com", "www.facebook.com",
+    "linkedin.com", "www.linkedin.com",
+    "yelp.com", "www.yelp.com",
+    "bbb.org", "www.bbb.org",
+    "mapquest.com", "www.mapquest.com",
+    "opencorporates.com", "www.opencorporates.com",
+    "dnb.com", "www.dnb.com",
+    "bloomberg.com", "www.bloomberg.com",
+    "crunchbase.com", "www.crunchbase.com",
+    "instagram.com", "www.instagram.com",
+    "x.com", "www.x.com",
+    "twitter.com", "www.twitter.com",
+    "chamberofcommerce.com", "www.chamberofcommerce.com",
+    "yellowpages.com", "www.yellowpages.com",
+    "angi.com", "www.angi.com",
+    "homeadvisor.com", "www.homeadvisor.com",
+}
 
 
-def safe_get(d, path, default=""):
-    cur = d
-    for p in path:
-        if not isinstance(cur, dict) or p not in cur:
-            return default
-        cur = cur[p]
-    return cur if cur is not None else default
+def normalize_domain(url: str) -> str:
+    try:
+        p = urlparse(url)
+        return (p.netloc or "").lower()
+    except Exception:
+        return ""
 
 
-def join_parts(parts):
-    parts = [p.strip() for p in parts if isinstance(p, str) and p.strip()]
-    return ", ".join(parts)
-
-
-def sam_get(url, params, retries=12, base_sleep=15):
+def extract_official_site_from_ddg(company: str, address: str) -> str:
     """
-    Robust SAM.gov GET with long retry for 429 and graceful handling.
-    - retries=12 with base_sleep=15 can wait ~ (15+30+60+120+...) up to ~1 hour worst case.
-    - If still blocked, we return None instead of crashing.
+    Very simple approach:
+    - search DuckDuckGo HTML endpoint
+    - take the first non-directory/non-social domain
+    - return the base domain URL (https://domain)
     """
-    last_response = None
+    query = f"{company} {address}"
+    ddg_url = "https://html.duckduckgo.com/html/"
+    r = requests.post(ddg_url, data={"q": query}, timeout=30, headers={
+        "User-Agent": "Mozilla/5.0 (compatible; CompanyWebsiteFinder/1.0)"
+    })
+    r.raise_for_status()
 
-    for attempt in range(retries):
-        r = requests.get(url, params=params, timeout=60)
-        last_response = r
+    soup = BeautifulSoup(r.text, "lxml")
+    links = soup.select("a.result__a")
 
-        if r.status_code == 429:
-            retry_after = r.headers.get("Retry-After")
-
-            if retry_after:
-                try:
-                    wait = int(retry_after)
-                except ValueError:
-                    wait = base_sleep * (2 ** attempt)
-            else:
-                wait = base_sleep * (2 ** attempt)
-
-            # Cap the wait so it doesn't explode forever
-            wait = min(wait, 600)  # max 10 minutes between tries
-            print(f"SAM rate-limited (429). Waiting {wait}s then retrying... (attempt {attempt+1}/{retries})")
-            time.sleep(wait)
+    for a in links[:10]:
+        href = a.get("href", "").strip()
+        if not href:
             continue
 
-        if r.status_code >= 400:
-            print(f"SAM request failed: {r.status_code} {r.text[:200]}")
-            r.raise_for_status()
+        domain = normalize_domain(href)
+        if not domain:
+            continue
 
-        return r
+        # Skip blocked / directory style results
+        if domain in BLOCKED_DOMAINS:
+            continue
 
-    # If we exhausted retries, do NOT crash the workflow—just return None
-    if last_response is not None and last_response.status_code == 429:
-        print("Still rate-limited after retries. Exiting gracefully (no rows appended this run).")
-        return None
+        # Skip obvious PDFs or odd files
+        if re.search(r"\.(pdf|doc|docx|xls|xlsx)$", href, re.IGNORECASE):
+            continue
 
-    # Otherwise raise the last error
-    if last_response is not None:
-        last_response.raise_for_status()
-    return None
+        # If we got here, accept
+        return f"https://{domain}"
 
-
-
-def fetch_awards_once():
-    """
-    ONE opportunities call for awards in the last DAYS_BACK days.
-    Then we filter by NAICS locally.
-    """
-    url = "https://api.sam.gov/opportunities/v2/search"
-
-    today = datetime.utcnow().date()
-    posted_to = today.strftime("%m/%d/%Y")
-    posted_from = (today - timedelta(days=DAYS_BACK)).strftime("%m/%d/%Y")
-
-    params = {
-        "api_key": SAM_API_KEY,
-        "ptype": "a",
-        "postedFrom": posted_from,
-        "postedTo": posted_to,
-        "limit": LIMIT,
-        "offset": 0,
-    }
-
-    r = sam_get(url, params)
-    if r is None:
-        return []
-
-    data = r.json()
-    return data.get("opportunitiesData") or []
-
-
-def fetch_entity_by_uei(uei: str):
-    if not uei:
-        return None
-
-    url = "https://api.sam.gov/entity-information/v2/entities"
-    params = {
-        "api_key": SAM_API_KEY,
-        "ueiSAM": uei,
-        "includeSections": "entityRegistration,coreData,pointsOfContact",
-    }
-
-    try:
-        r = sam_get(url, params, retries=6, base_sleep=5)
-        return r.json()
-    except requests.HTTPError:
-        return None
-
-
-def extract_website_phone_from_entity(entity_json: dict):
-    if not isinstance(entity_json, dict):
-        return ("", "", "")
-
-    entity_list = entity_json.get("entityData") or entity_json.get("entities") or []
-    if not entity_list:
-        return ("", "", "")
-
-    e = entity_list[0] if isinstance(entity_list, list) else entity_list
-
-    website = (
-        safe_get(e, ["entityRegistration", "url"], "")
-        or safe_get(e, ["entityRegistration", "website"], "")
-        or safe_get(e, ["coreData", "url"], "")
-        or safe_get(e, ["coreData", "website"], "")
-        or ""
-    )
-
-    url_list = safe_get(e, ["coreData", "urlList"], []) or safe_get(e, ["entityRegistration", "urlList"], [])
-    if not website and isinstance(url_list, list):
-        for item in url_list:
-            if isinstance(item, dict):
-                u = item.get("url") or item.get("value")
-                if u:
-                    website = u
-                    break
-            elif isinstance(item, str) and item.strip():
-                website = item.strip()
-                break
-
-    phone = (
-        safe_get(e, ["pointsOfContact", "governmentBusinessPOC", "usPhone"], "")
-        or safe_get(e, ["pointsOfContact", "electronicBusinessPOC", "usPhone"], "")
-        or safe_get(e, ["pointsOfContact", "pastPerformancePOC", "usPhone"], "")
-        or safe_get(e, ["entityRegistration", "usPhone"], "")
-        or safe_get(e, ["coreData", "usPhone"], "")
-        or ""
-    )
-
-    address = join_parts([
-        safe_get(e, ["entityRegistration", "physicalAddress", "addressLine1"], ""),
-        safe_get(e, ["entityRegistration", "physicalAddress", "addressLine2"], ""),
-        safe_get(e, ["entityRegistration", "physicalAddress", "city"], ""),
-        safe_get(e, ["entityRegistration", "physicalAddress", "stateOrProvinceCode"], ""),
-        safe_get(e, ["entityRegistration", "physicalAddress", "zipCode"], ""),
-        safe_get(e, ["entityRegistration", "physicalAddress", "countryCode"], ""),
-    ])
-
-    return (website, phone, address)
+    return ""
 
 
 def main():
-    ensure_header()
+    # Google auth
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
+    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+    client = gspread.authorize(creds)
 
-    awards = fetch_awards_once()
+    ws = client.open_by_key(SPREADSHEET_ID).worksheet(SHEET_TAB_NAME)
 
-    rows_to_append = []
-    entity_cache = {}  # uei -> (website, phone, address)
+    # Read all values for columns A..R (we need A, P, R)
+    # This grabs a rectangular range which is simplest for beginners.
+    values = ws.get_values("A:R")
 
-    for item in awards:
-        d = item.get("data", item)
-        naics_code = item.get("naicsCode") or d.get("naicsCode") or ""
+    if not values or len(values) < 2:
+        print("No data found.")
+        return
 
-        # Filter locally by NAICS (reduces SAM search calls to 1)
-        if naics_code not in NAICS_CODES:
-            continue
+    # Identify rows to process:
+    # Row 1 is header; data starts at row 2.
+    rows_to_update = []
+    processed = 0
 
-        company = (
-            safe_get(d, ["award", "awardee", "name"], "")
-            or safe_get(d, ["award", "awardee", "legalBusinessName"], "")
-            or ""
-        )
+    for i in range(1, len(values)):
+        row_num = i + 1  # because sheet rows are 1-indexed
+
+        row = values[i]
+        # Ensure row has at least 18 columns (R is 18th)
+        while len(row) < 18:
+            row.append("")
+
+        company = (row[0] or "").strip()       # Column A
+        address = (row[15] or "").strip()      # Column P (A=0, P=15)
+        existing_site = (row[17] or "").strip()  # Column R (A=0, R=17)
+
+        # Skip if no company or already has website
         if not company:
             continue
+        if existing_site:
+            continue
 
-        loc = safe_get(d, ["award", "awardee", "location"], {}) or {}
-        award_address = join_parts([
-            loc.get("streetAddress", "") if isinstance(loc, dict) else "",
-            loc.get("streetAddress2", "") if isinstance(loc, dict) else "",
-            (loc.get("city") or {}).get("name") if isinstance(loc.get("city"), dict) else (loc.get("city") or ""),
-            (loc.get("state") or {}).get("name") if isinstance(loc.get("state"), dict) else (loc.get("state") or ""),
-            loc.get("zip", "") if isinstance(loc, dict) else "",
-            (loc.get("country") or {}).get("name") if isinstance(loc.get("country"), dict) else (loc.get("country") or ""),
-        ])
+        # Skip if no address (optional; you can relax this later)
+        if not address:
+            continue
 
-        website = safe_get(d, ["award", "awardee", "website"], "") or safe_get(d, ["award", "awardee", "url"], "")
-        phone = safe_get(d, ["award", "awardee", "phone"], "") or safe_get(d, ["award", "awardee", "telephone"], "")
+        website = extract_official_site_from_ddg(company, address)
 
-        uei = (
-            safe_get(d, ["award", "awardee", "ueiSAM"], "")
-            or safe_get(d, ["award", "awardee", "uei"], "")
-            or safe_get(d, ["award", "awardee", "uniqueEntityId"], "")
-        )
+        if website:
+            rows_to_update.append((row_num, website))
+        else:
+            # Leave blank if not found (you can change this to "REVIEW" later)
+            rows_to_update.append((row_num, ""))
 
-        if (not website or not phone or not award_address) and uei:
-            if uei not in entity_cache:
-                entity_json = fetch_entity_by_uei(uei)
-                entity_cache[uei] = extract_website_phone_from_entity(entity_json)
-                time.sleep(ENTITY_LOOKUP_DELAY_SECONDS)
+        processed += 1
+        time.sleep(SLEEP_SECONDS)
 
-            ent_website, ent_phone, ent_address = entity_cache[uei]
-            if not website and ent_website:
-                website = ent_website
-            if not phone and ent_phone:
-                phone = ent_phone
-            if not award_address and ent_address:
-                award_address = ent_address
+        if processed >= BATCH_SIZE:
+            break
 
-        rows_to_append.append([company, website, award_address, phone, naics_code])
+    if not rows_to_update:
+        print("Nothing to update (no blank websites found in this batch).")
+        return
 
-    if rows_to_append:
-        sheet.append_rows(rows_to_append, value_input_option="RAW")
+    # Batch update Column R
+    data = []
+    for row_num, website in rows_to_update:
+        data.append({
+            "range": f"R{row_num}",
+            "values": [[website]]
+        })
 
-    print(f"Done. Added {len(rows_to_append)} rows.")
+    ws.batch_update(data)
+    print(f"Done. Processed {processed} rows; updated {len(rows_to_update)} cells in column R.")
 
 
 if __name__ == "__main__":
