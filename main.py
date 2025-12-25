@@ -34,12 +34,14 @@ DDG_SLEEP_SECONDS = float(os.environ.get("DDG_SLEEP_SECONDS", "2.5"))
 # J = row_type
 # L = Website output
 # M = sam_lookup_status output
+# N = sam_http_debug output (new)
 COL_COMPANY = 1          # A
 COL_UEI = 2              # B
 COL_ADDRESS = 3          # C
 COL_ROW_TYPE = 10        # J
 COL_WEBSITE_OUT = 12     # L
 COL_STATUS_OUT = 13      # M
+COL_DEBUG_OUT = 14       # N
 
 ROW_TYPE_COMPANY = "COMPANY"
 
@@ -162,41 +164,51 @@ def is_blacklisted(domain: str, exact_domains: set, contains_patterns: list) -> 
     return False
 
 
-# ========= SAM.gov LOOKUP =========
-def sam_lookup_entity_by_uei(uei: str) -> dict:
+# ========= SAM.gov LOOKUP (HARDENED) =========
+def sam_lookup_entity_by_uei(uei: str):
     """
     Query SAM.gov Entity Information API by UEI.
-    Endpoint:
-      https://api.sam.gov/entity-information/v4/entities?api_key=...&ueiSAM=...
+
+    Returns:
+      payload: dict (or {})
+      http_status: int (0 if request failed before HTTP response)
+      debug: short string (first 160 chars of response or error)
     """
     uei = (uei or "").strip()
     if not uei:
-        return {}
+        return {}, 0, "NO_UEI"
 
     url = "https://api.sam.gov/entity-information/v4/entities"
+
+    # Send key via header (preferred) + api_key query param (compatibility)
+    headers = {
+        "Accept": "application/json",
+        "X-Api-Key": SAM_API_KEY,
+        "User-Agent": "Mozilla/5.0 (compatible; CompaniesEnrichment/1.0)"
+    }
+
     params = {
-        "api_key": SAM_API_KEY,
         "ueiSAM": uei,
-        "includeSections": "coreData,entityRegistration"
+        "api_key": SAM_API_KEY,
+        "includeSections": "coreData,entityRegistration",
     }
 
     try:
-        headers = {
-    "Accept": "application/json",
-    "X-Api-Key": SAM_API_KEY
-}
+        r = requests.get(url, params=params, headers=headers, timeout=30)
+    except Exception as e:
+        return {}, 0, f"REQUEST_FAIL: {str(e)[:160]}"
 
-r = requests.get(url, params={"ueiSAM": uei}, timeout=30, headers=headers)
-    except Exception:
-        return {}
+    status = r.status_code
+    text = (r.text or "").strip()
+    debug = text[:160].replace("\n", " ").replace("\r", " ")
 
-    if r.status_code != 200:
-        return {}
+    if status != 200:
+        return {}, status, debug or f"HTTP_{status}"
 
     try:
-        return r.json()
+        return r.json(), status, "OK"
     except Exception:
-        return {}
+        return {}, status, (debug or "PARSE_ERROR")[:160]
 
 
 def find_candidate_urls(obj) -> list[str]:
@@ -270,7 +282,7 @@ def choose_best_official_site(candidates: list[str], exact_domains: set, contain
 # ========= DDG FALLBACK =========
 def ddg_search_best_site(company: str, address: str, exact_domains: set, contains_patterns: list) -> str:
     """
-    Only called when SAM returned NOT_FOUND.
+    Only called when SAM returned 200 but no website was found (NOT_FOUND).
     - Search DDG HTML
     - Take first acceptable non-blacklisted domain
     """
@@ -330,8 +342,8 @@ def main():
 
     exact_domains, contains_patterns = load_blacklist_rules(ws_blacklist)
 
-    # Read A:M (so we can check status too if needed)
-    values = ws.get_values("A:M")
+    # Read A:N (so we can check/write debug column too)
+    values = ws.get_values("A:N")
     if not values or len(values) < 2:
         print("No data found in Companies_Enrichment.")
         return
@@ -342,7 +354,7 @@ def main():
     for i in range(1, len(values)):
         row_num = i + 1
         row = values[i]
-        while len(row) < 13:
+        while len(row) < 14:
             row.append("")
 
         company = (row[COL_COMPANY - 1] or "").strip()
@@ -350,7 +362,6 @@ def main():
         address = (row[COL_ADDRESS - 1] or "").strip()
         row_type = (row[COL_ROW_TYPE - 1] or "").strip().upper()
         existing_site = (row[COL_WEBSITE_OUT - 1] or "").strip()
-        existing_status = (row[COL_STATUS_OUT - 1] or "").strip().upper()
 
         if row_type != ROW_TYPE_COMPANY:
             continue
@@ -359,38 +370,41 @@ def main():
         if existing_site:
             continue
 
-        # If you want to avoid reprocessing permanent outcomes, uncomment:
-        # if existing_status in ("FOUND", "NOT_FOUND", "NO_UEI"):
-        #     continue
-
         website = ""
         status = ""
+        debug = ""
 
         if not uei:
             status = "NO_UEI"
+            debug = "NO_UEI"
         else:
-            payload = sam_lookup_entity_by_uei(uei)
-            if not payload:
-                status = "API_ERROR"
+            payload, http_status, http_debug = sam_lookup_entity_by_uei(uei)
+            debug = http_debug
+
+            if http_status == 0:
+                status = "API_ERROR_REQUEST_FAIL"
+            elif http_status == 401:
+                status = "AUTH_ERROR_401"
+            elif http_status == 403:
+                status = "AUTH_ERROR_403"
+            elif http_status == 429:
+                status = "RATE_LIMIT_429"
+            elif http_status != 200:
+                status = f"API_ERROR_{http_status}"
             else:
                 candidates = find_candidate_urls(payload)
                 website = choose_best_official_site(candidates, exact_domains, contains_patterns)
+                status = "FOUND" if website else "NOT_FOUND"
 
-                if website:
-                    status = "FOUND"
-                else:
-                    # SAM found no usable website. Fallback to DDG (only in this case).
-                    status = "NOT_FOUND"
+                # Fallback only if SAM was reachable (200) but didn't give a usable website
+                if status == "NOT_FOUND" and address:
+                    time.sleep(DDG_SLEEP_SECONDS)
+                    ddg_site = ddg_search_best_site(company, address, exact_domains, contains_patterns)
+                    if ddg_site:
+                        website = ddg_site
+                        status = "FOUND_DDG_FALLBACK"
 
-                    if address:  # DDG works better with address
-                        time.sleep(DDG_SLEEP_SECONDS)
-                        ddg_site = ddg_search_best_site(company, address, exact_domains, contains_patterns)
-                        if ddg_site:
-                            website = ddg_site
-                            # distinguish fallback success
-                            status = "FOUND_DDG_FALLBACK"
-
-        updates.append((row_num, website, status))
+        updates.append((row_num, website, status, debug))
         processed += 1
 
         time.sleep(SLEEP_SECONDS)
@@ -401,18 +415,18 @@ def main():
         print("Nothing to update (no eligible COMPANY rows with blank website).")
         return
 
-    # Write L (website) + M (status) together
+    # Write L (website) + M (status) + N (debug)
     batch = []
-    for row_num, website, status in updates:
+    for row_num, website, status, debug in updates:
         batch.append({
-            "range": f"L{row_num}:M{row_num}",
-            "values": [[website, status]]
+            "range": f"L{row_num}:N{row_num}",
+            "values": [[website, status, debug]]
         })
 
     ws.batch_update(batch)
 
-    ok = sum(1 for _, w, _ in updates if w)
-    print(f"Done. Processed {processed} companies; wrote {ok} websites; updated {len(updates)} rows (L:M).")
+    ok = sum(1 for _, w, _, _ in updates if w)
+    print(f"Done. Processed {processed} companies; wrote {ok} websites; updated {len(updates)} rows (L:N).")
 
 
 if __name__ == "__main__":
