@@ -17,11 +17,17 @@ GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 SHEET_TAB_NAME = os.environ.get("SHEET_TAB_NAME", "Companies_Enrichment")
 BLACKLIST_TAB_NAME = os.environ.get("BLACKLIST_TAB_NAME", "Blacklist_Rules")
 
-# Limit per run (default 50 for DDG; adjust as you like)
+# Limit per run (default 50)
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "50"))
 
 # Polite pacing between searches
 DDG_SLEEP_SECONDS = float(os.environ.get("DDG_SLEEP_SECONDS", "2.5"))
+
+# Quick homepage validation (seconds)
+HOMEPAGE_TIMEOUT = float(os.environ.get("HOMEPAGE_TIMEOUT", "10"))
+
+# Minimum score required to accept a DDG candidate
+MIN_ACCEPT_SCORE = int(os.environ.get("MIN_ACCEPT_SCORE", "40"))
 
 
 # ========= SHEET COLUMN MAP (1-indexed) =========
@@ -29,8 +35,8 @@ DDG_SLEEP_SECONDS = float(os.environ.get("DDG_SLEEP_SECONDS", "2.5"))
 # C = Recipient (HQ) Address
 # J = row_type
 # L = Website output (shared)
-# O = ddg_lookup_status (new)
-# P = ddg_debug (new)
+# O = ddg_lookup_status
+# P = ddg_debug
 COL_COMPANY = 1           # A
 COL_ADDRESS = 3           # C
 COL_ROW_TYPE = 10         # J
@@ -61,8 +67,48 @@ BLOCKED_DOMAINS = {
     "homeadvisor.com", "www.homeadvisor.com",
 }
 
+# ========= SUSPICIOUS KEYWORDS IN DOMAINS (AUTO-REJECT) =========
+# Stops new "registry/directory/report/list" variants without manual blacklisting.
+SUSPICIOUS_DOMAIN_CONTAINS = [
+    "registry", "directory", "report", "naics", "cage", "bidhub", "bid-hub",
+    "opengov", "opencorp", "bizprofile", "buzzfile", "allbiz", "buildzoom",
+    "thebluebook", "bluebook", "corporationwiki", "cortera", "dnb", "dun",
+    "sec", "sos", "companyregistry", "usaspending", "sam.gov", "govcb",
+    "govt", "governmentbid", "contractorinfo", "contractor-info", "listings",
+    "listing", "database", "search", "companies", "companysearch", "entitysearch",
+]
+
+# ========= HOMEPAGE PATTERNS THAT SCREAM "DIRECTORY/REGISTRY" =========
+HOMEPAGE_BAD_PHRASES = [
+    "business registry",
+    "company registry",
+    "company profile",
+    "company directory",
+    "search the database",
+    "search our database",
+    "entity search",
+    "cage code",
+    "naics code",
+    "government contractors",
+    "contractor directory",
+    "find company information",
+    "lookup company",
+    "free company search",
+    "public records",
+    "state records",
+    "registered agent",
+    "sec filings",
+]
+
 
 def normalize_domain_from_anything(url_or_domain: str) -> str:
+    """
+    Normalize URL/domain:
+    - lower
+    - strip scheme
+    - strip path/query/hash
+    - strip leading www.
+    """
     if not url_or_domain:
         return ""
 
@@ -86,7 +132,41 @@ def canonical_https(url_or_domain: str) -> str:
     return f"https://{d}" if d else ""
 
 
+def normalize_company_tokens(company: str) -> list[str]:
+    """
+    Create a small set of meaningful tokens from company name for scoring.
+    Removes corporate suffixes and very short noise words.
+    """
+    if not company:
+        return []
+
+    c = company.lower()
+    c = re.sub(r"[^a-z0-9\s]", " ", c)
+    raw = [t for t in c.split() if t]
+
+    stop = {
+        "inc", "incorporated", "llc", "ltd", "limited", "co", "company", "corp",
+        "corporation", "group", "holdings", "holding", "the", "and", "of", "services",
+        "service", "solutions", "international", "global", "industries", "industry",
+    }
+    tokens = []
+    for t in raw:
+        if t in stop:
+            continue
+        if len(t) < 3:
+            continue
+        tokens.append(t)
+
+    # Keep it small (for predictable scoring)
+    return tokens[:4]
+
+
 def load_blacklist_rules(ws_blacklist):
+    """
+    Blacklist_Rules headers expected:
+      rule_type | match_value | reason | example_url | enabled
+    rule_type: EXACT_DOMAIN or DOMAIN_CONTAINS
+    """
     values = ws_blacklist.get_all_values()
     if not values or len(values) < 2:
         return set(), []
@@ -132,13 +212,22 @@ def is_blacklisted(domain: str, exact_domains: set, contains_patterns: list) -> 
         return True
 
     d = domain.lower().strip()
+
     if d in BLOCKED_DOMAINS:
         return True
+
+    # Auto-reject suspicious domain patterns (registry/directory/report/etc.)
+    for pat in SUSPICIOUS_DOMAIN_CONTAINS:
+        if pat and pat in d:
+            return True
+
     if d in exact_domains:
         return True
+
     for pat in contains_patterns:
         if pat and pat in d:
             return True
+
     return False
 
 
@@ -148,7 +237,7 @@ def ddg_search_candidates(query: str) -> list[str]:
         ddg_url,
         data={"q": query},
         timeout=30,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; CompanyWebsiteFinder/1.0)"}
+        headers={"User-Agent": "Mozilla/5.0 (compatible; CompanyWebsiteFinder/2.0)"}
     )
     r.raise_for_status()
 
@@ -156,19 +245,90 @@ def ddg_search_candidates(query: str) -> list[str]:
     links = soup.select("a.result__a")
 
     out = []
-    for a in links[:12]:
+    for a in links[:15]:
         href = (a.get("href") or "").strip()
-        if not href:
-            continue
-        out.append(href)
+        if href:
+            out.append(href)
     return out
 
 
-def choose_best_candidate(hrefs: list[str], exact_domains: set, contains_patterns: list) -> tuple[str, str]:
+def score_candidate(domain: str, company_tokens: list[str]) -> int:
     """
-    Returns (website, debug_note)
+    Higher score = more likely to be official website.
     """
+    if not domain:
+        return -10**9
+
+    d = domain.lower().strip()
+    score = 0
+
+    # Penalize long domains and deep subdomains
+    score -= min(len(d), 80)  # length penalty
+    parts = d.split(".")
+    sub_penalty = max(0, len(parts) - 2)
+    score -= 15 * sub_penalty
+
+    # Reward presence of company tokens in the domain
+    for t in company_tokens:
+        if t and t in d:
+            score += 30
+
+    # Small reward for "brand-like" short domains
+    if len(d) <= 18:
+        score += 10
+
+    return score
+
+
+def homepage_looks_like_directory(url: str) -> tuple[bool, str]:
+    """
+    Quick validation: fetch homepage text and look for directory/registry phrases.
+    Returns (is_bad, reason).
+    """
+    if not url:
+        return True, "no_url"
+
+    try:
+        r = requests.get(
+            url,
+            timeout=HOMEPAGE_TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; CompanyWebsiteFinder/2.0)"}
+        )
+    except Exception as e:
+        # If homepage fetch fails, we do NOT automatically reject (some sites block bots).
+        # We just note it.
+        return False, f"homepage_fetch_failed:{type(e).__name__}"
+
+    if r.status_code >= 400:
+        return False, f"homepage_http_{r.status_code}"
+
+    text = (r.text or "").lower()
+    # strip scripts/styles quickly to reduce noise (simple heuristic)
+    text = re.sub(r"<script.*?>.*?</script>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<style.*?>.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+
+    for phrase in HOMEPAGE_BAD_PHRASES:
+        if phrase in text:
+            return True, f"homepage_phrase:{phrase}"
+
+    return False, "homepage_ok"
+
+
+def choose_best_candidate(hrefs: list[str], company: str, exact_domains: set, contains_patterns: list) -> tuple[str, str, int]:
+    """
+    Returns (website, debug_note, score)
+    - Filters blacklisted domains
+    - Scores remaining candidates
+    - Validates homepage for directory/registry fingerprints
+    - Accepts only if score >= MIN_ACCEPT_SCORE
+    """
+    company_tokens = normalize_company_tokens(company)
+    candidates = []
+
+    checked = 0
     for href in hrefs:
+        checked += 1
+
         # Skip obvious files
         if re.search(r"\.(pdf|doc|docx|xls|xlsx)$", href, re.IGNORECASE):
             continue
@@ -180,9 +340,28 @@ def choose_best_candidate(hrefs: list[str], exact_domains: set, contains_pattern
         if is_blacklisted(domain, exact_domains, contains_patterns):
             continue
 
-        return canonical_https(domain), f"picked={domain}"
+        score = score_candidate(domain, company_tokens)
+        candidates.append((score, domain))
 
-    return "", "no_acceptable_result"
+    if not candidates:
+        return "", f"no_acceptable_domain;checked={checked}", -10**9
+
+    # Highest score first
+    candidates.sort(reverse=True, key=lambda x: x[0])
+
+    # Try top few candidates with homepage validation
+    for score, domain in candidates[:6]:
+        url = canonical_https(domain)
+        is_bad, reason = homepage_looks_like_directory(url)
+        if is_bad:
+            continue
+
+        if score < MIN_ACCEPT_SCORE:
+            return "", f"low_confidence;top={domain};score={score};checked={checked};homepage={reason}", score
+
+        return url, f"picked={domain};score={score};checked={checked};homepage={reason}", score
+
+    return "", f"rejected_by_homepage_validation;top={candidates[0][1]};checked={checked}", candidates[0][0]
 
 
 def main():
@@ -213,7 +392,7 @@ def main():
     for i in range(1, len(values)):
         row_num = i + 1
         row = values[i]
-        while len(row) < 16:  # up to P
+        while len(row) < 16:
             row.append("")
 
         company = (row[COL_COMPANY - 1] or "").strip()
@@ -234,13 +413,28 @@ def main():
         ddg_debug = ""
         website = ""
 
-        try:
-            hrefs = ddg_search_candidates(query)
-            website, ddg_debug = choose_best_candidate(hrefs, exact_domains, contains_patterns)
-            ddg_status = "FOUND" if website else "NOT_FOUND"
-        except Exception as e:
-            ddg_status = "ERROR"
-            ddg_debug = str(e)[:160]
+        if not query:
+            ddg_status = "SKIP_NO_QUERY"
+            ddg_debug = "empty_company_and_address"
+        else:
+            try:
+                hrefs = ddg_search_candidates(query)
+                website, ddg_debug, score = choose_best_candidate(
+                    hrefs, company, exact_domains, contains_patterns
+                )
+
+                if website:
+                    ddg_status = "FOUND"
+                else:
+                    # distinguish cases that need human review vs truly not found
+                    if ddg_debug.startswith("low_confidence"):
+                        ddg_status = "REVIEW"
+                    else:
+                        ddg_status = "NOT_FOUND"
+
+            except Exception as e:
+                ddg_status = "ERROR"
+                ddg_debug = f"{type(e).__name__}: {str(e)[:140]}"
 
         updates.append((row_num, website, ddg_status, ddg_debug))
         processed += 1
@@ -262,12 +456,17 @@ def main():
         })
         batch.append({
             "range": f"O{row_num}:P{row_num}",
-            "values": [[ddg_status, ddg_debug]]
+            "values": [[ddg_status, ddg_debug[:160]]]
         })
 
     ws.batch_update(batch)
+
     ok = sum(1 for _, w, _, _ in updates if w)
-    print(f"Done. Processed {processed} companies; wrote {ok} websites; updated {len(updates)} rows (L + O:P).")
+    review = sum(1 for _, w, s, _ in updates if (not w and s == "REVIEW"))
+    print(
+        f"Done. Processed {processed} companies; wrote {ok} websites; "
+        f"flagged {review} for REVIEW; updated {len(updates)} rows (L + O:P)."
+    )
 
 
 if __name__ == "__main__":
