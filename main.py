@@ -181,7 +181,12 @@ def sam_lookup_entity_by_uei(uei: str) -> dict:
     }
 
     try:
-        r = requests.get(url, params=params, timeout=30, headers={"Accept": "application/json"})
+        headers = {
+    "Accept": "application/json",
+    "X-Api-Key": SAM_API_KEY
+}
+
+r = requests.get(url, params={"ueiSAM": uei}, timeout=30, headers=headers)
     except Exception:
         return {}
 
