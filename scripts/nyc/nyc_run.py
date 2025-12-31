@@ -83,10 +83,9 @@ def header_map(ws):
     return {h: i + 1 for i, h in enumerate(headers)}
 
 
-def load_existing_award_ids(ws, award_id_header="Award ID") -> set[str]:
+def load_existing_award_ids(ws) -> set[str]:
     """Read existing Award IDs to avoid duplicates."""
     col_values = ws.col_values(1)  # Column A expected Award ID
-    # First row is header; skip blanks
     return {v.strip() for v in col_values[1:] if v and v.strip()}
 
 
@@ -95,13 +94,11 @@ def infer_naics(job_record: dict, permit_record: dict | None) -> str:
     Conservative NAICS inference.
     You can refine mapping later once you inspect real field distributions.
     """
-    # Candidate fields that may hint at discipline/type
     work_type = first_present(job_record, ["work_type", "job_type", "jobtype", "job_type_code"])
     permit_type = first_present(permit_record or {}, ["permit_type", "permit_subtype", "permittypename"]) if permit_record else ""
 
     text = f"{work_type} {permit_type}".lower()
 
-    # Very simple keyword mapping:
     if "elect" in text:
         return "238210"
     if "plumb" in text or "hvac" in text or "mechanic" in text or "boiler" in text:
@@ -111,7 +108,6 @@ def infer_naics(job_record: dict, permit_record: dict | None) -> str:
     if "bridge" in text or "highway" in text or "street" in text or "road" in text:
         return "237310"
 
-    # Default for most DOB building jobs:
     return "236220"
 
 
@@ -129,12 +125,10 @@ def score_and_quarter_start(job: dict, permit: dict | None) -> tuple[int, str, s
     """
     Returns: (score 0-100, start_date YYYY-MM-DD or "", rationale)
     Start dates anchored: Q2=2026-04-01, Q3=2026-07-01, Q4=2026-10-01
-    Only assigns start_date if score >= 70.
     """
     score = 0
     rationale_parts = []
 
-    # Status/permit signals
     permit_issued = first_present(permit or {}, ["issuance_date", "permit_issued_date", "issued_date", "issue_date"])
     job_status = first_present(job, ["job_status", "status", "jobstatus"])
 
@@ -150,8 +144,8 @@ def score_and_quarter_start(job: dict, permit: dict | None) -> tuple[int, str, s
             score += 10
             rationale_parts.append(f"job_status={job_status}(+10)")
 
-    # Timing signals (look at year)
     filed_date = first_present(job, ["filing_date", "filed_date", "application_date", "date_filed"])
+
     def year_of(d: str) -> int | None:
         try:
             return int(d[:4])
@@ -171,7 +165,6 @@ def score_and_quarter_start(job: dict, permit: dict | None) -> tuple[int, str, s
         score += 10
         rationale_parts.append("filed_year=2024(+10)")
 
-    # Job type
     job_type = first_present(job, ["job_type", "jobtype", "work_type"])
     jt = job_type.upper()
     if "NB" in jt or "NEW" in jt:
@@ -181,7 +174,6 @@ def score_and_quarter_start(job: dict, permit: dict | None) -> tuple[int, str, s
         score += 10
         rationale_parts.append(f"job_type={job_type}(+10)")
 
-    # Cost
     est_cost_raw = first_present(job, ["estimated_job_cost", "estimated_cost", "job_cost", "estimatedconstructioncost"])
     est_cost = 0.0
     if est_cost_raw:
@@ -200,18 +192,12 @@ def score_and_quarter_start(job: dict, permit: dict | None) -> tuple[int, str, s
         score += 5
         rationale_parts.append("est_cost>=1M(+5)")
 
-    # Not started (we only have proxies; keep conservative)
-    # If there is a completion/signoff field, use it as exclusion:
     completion = first_present(job, ["completion_date", "signed_off_date", "job_completed_date"])
     if completion:
-        # Exclude effectively by forcing score low
-        rationale_parts.append(f"completion_date={completion}(exclude)")
         return (0, "", "Excluded: completed/signed off")
 
-    # Assign quarter start date if >=70
     start_date = ""
     if score >= 70:
-        # Use permit issued month when available; otherwise default to Q3
         q2 = "2026-04-01"
         q3 = "2026-07-01"
         q4 = "2026-10-01"
@@ -234,11 +220,9 @@ def score_and_quarter_start(job: dict, permit: dict | None) -> tuple[int, str, s
                 start_date = q4
                 rationale_parts.append("quarter=Q4(permitted Oct-Dec 2025)")
         else:
-            # Conservative default for strong but not permitted-yet jobs
             start_date = q3
             rationale_parts.append("quarter=Q3(default)")
 
-        # Clamp to Q2–Q4 only
         if start_date not in (q2, q3, q4):
             start_date = q3
 
@@ -247,9 +231,7 @@ def score_and_quarter_start(job: dict, permit: dict | None) -> tuple[int, str, s
 
 
 def build_links(award_id: str) -> tuple[str, str]:
-    # DOB NOW public portal links differ; we keep a safe search link pattern for now.
     web_search = f"https://www.google.com/search?q={award_id}+site%3Adata.cityofnewyork.us"
-    # Placeholder award link; you can refine once you confirm the public portal format you want.
     award_link = f"https://data.cityofnewyork.us/resource/{DATASET_JOB_FILINGS}.json?$where=job__={award_id}"
     return award_link, web_search
 
@@ -265,6 +247,19 @@ def main():
     max_pages = int(os.environ.get("NYC_MAX_PAGES", "5"))  # safety cap
     sleep_seconds = float(os.environ.get("NYC_SLEEP_SECONDS", "0.25"))
 
+    # Discovery controls
+    min_score = int(os.environ.get("NYC_MIN_SCORE", "70"))  # use 40 in discovery mode
+    discovery_mode = os.environ.get("NYC_DISCOVERY_MODE", "false").lower() == "true"
+
+    # Debug counters
+    c_jobs_pulled = 0
+    c_with_award_id = 0
+    c_new_not_dupe = 0
+    c_naics_allowed = 0
+    c_scored_ge_min = 0
+    c_assigned_q2026 = 0
+    c_appended = 0
+
     # 1) Connect to Google Sheet
     gc = get_gspread_client()
     sh = gc.open_by_key(sheet_id)
@@ -272,7 +267,7 @@ def main():
     hmap = header_map(ws)
     existing_ids = load_existing_award_ids(ws)
 
-    # 2) Pull approved permits (recent-ish) and index by job number where possible
+    # 2) Pull approved permits and index by job number
     permits_by_job = {}
     for page in range(max_pages):
         rows = socrata_get(DATASET_APPROVED_PERMITS, where=None, limit=batch_size, offset=page * batch_size)
@@ -293,12 +288,17 @@ def main():
         if not jobs:
             break
 
+        c_jobs_pulled += len(jobs)
+
         for job in jobs:
             award_id = first_present(job, ["job__", "job_number", "jobno", "job"])
             if not award_id:
                 continue
+            c_with_award_id += 1
+
             if award_id in existing_ids:
                 continue
+            c_new_not_dupe += 1
 
             permit = permits_by_job.get(award_id)
 
@@ -306,24 +306,34 @@ def main():
             naics = infer_naics(job, permit)
             if naics not in ALLOWED_NAICS:
                 continue
+            c_naics_allowed += 1
 
             score, start_date, rationale = score_and_quarter_start(job, permit)
-            # Only keep Q2–Q4 2026 targets with score>=70 and start_date assigned
-            if score < 70 or start_date not in {"2026-04-01", "2026-07-01", "2026-10-01"}:
+
+            # Score threshold (min_score: 70 normally, lower during discovery)
+            if score >= min_score:
+                c_scored_ge_min += 1
+            else:
+                continue
+
+            # Discovery mode: if no Start Date assigned, force Q3 2026 just to inspect intake
+            if discovery_mode and not start_date:
+                start_date = "2026-07-01"
+                rationale = rationale + "; discovery_mode_forced_Q3_2026"
+
+            if start_date in {"2026-04-01", "2026-07-01", "2026-10-01"}:
+                c_assigned_q2026 += 1
+            else:
                 continue
 
             company = first_present(job, ["contractor_name", "owner_business_name", "applicant_business_name", "business_name"])
             hq_addr = first_present(job, ["applicant_address", "owner_address", "business_address"])
             pop = first_present(job, ["house__", "house_number", "street_name", "borough", "zip_code", "address"])
-
             awarding = first_present(job, ["owner_name", "applicant_name", "developer_name"])
             desc = first_present(job, ["job_description", "description", "work_description"])
-
             est_cost = first_present(job, ["estimated_job_cost", "estimated_cost", "job_cost", "estimatedconstructioncost"])
 
             award_link, web_search = build_links(award_id)
-
-            # Create recipient_id deterministic
             recipient_id = hashlib.md5(award_id.encode("utf-8")).hexdigest()
 
             values = {
@@ -345,7 +355,7 @@ def main():
                 "Award Link": award_link,
                 "Recipient Profile Link": "",
                 "Web Search Link": web_search,
-                # Enrichment columns left blank for now (we will fill later)
+                # Enrichment columns left blank for now
                 "Company Website": "",
                 "Company Phone": "",
                 "Company General Email": "",
@@ -368,21 +378,31 @@ def main():
                 "notes": "",
             }
 
-            # Convert to row in correct header order
             ordered_row = [""] * len(hmap)
             for header, col_index in hmap.items():
                 ordered_row[col_index - 1] = values.get(header, "")
+
             rows_to_append.append(ordered_row)
             existing_ids.add(award_id)
 
         time.sleep(sleep_seconds)
 
-    # 4) Append rows in one batch (fast + less API calls)
+    # 4) Append + print debug
     if rows_to_append:
         ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
-        print(f"✅ Appended {len(rows_to_append)} rows.")
+        c_appended = len(rows_to_append)
+        print(f"✅ Appended {c_appended} rows.")
     else:
-        print("No new target rows found (Q2–Q4 2026 + NAICS filter + score>=70).")
+        print("No new target rows found (with current thresholds/filters).")
+
+    print("---- NYC PIPELINE DEBUG COUNTS ----")
+    print(f"Jobs pulled: {c_jobs_pulled}")
+    print(f"With Award ID: {c_with_award_id}")
+    print(f"New (not duplicate): {c_new_not_dupe}")
+    print(f"NAICS allowed: {c_naics_allowed}")
+    print(f"Score >= min_score ({min_score}): {c_scored_ge_min}")
+    print(f"Assigned Q2–Q4 2026 start: {c_assigned_q2026}")
+    print(f"Rows appended: {c_appended}")
 
 
 if __name__ == "__main__":
