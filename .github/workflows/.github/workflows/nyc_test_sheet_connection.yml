@@ -1,0 +1,30 @@
+name: NYC - Test Google Sheet Connection
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-connection:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run NYC sheet connection test
+        env:
+          NYC_GOOGLE_CREDENTIALS_JSON: ${{ secrets.NYC_GOOGLE_CREDENTIALS_JSON }}
+          NYC_SHEET_ID: ${{ secrets.NYC_SHEET_ID }}
+          NYC_TAB_NAME: ${{ secrets.NYC_TAB_NAME }}
+        run: |
+          python scripts/nyc/test_sheet_connection.py
