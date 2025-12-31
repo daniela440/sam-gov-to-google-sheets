@@ -22,7 +22,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run NYC pipeline
+           - name: Run NYC pipeline
         env:
           NYC_GOOGLE_CREDENTIALS_JSON: ${{ secrets.NYC_GOOGLE_CREDENTIALS_JSON }}
           NYC_SHEET_ID: ${{ secrets.NYC_SHEET_ID }}
@@ -31,5 +31,7 @@ jobs:
           NYC_BATCH_SIZE: "200"
           NYC_MAX_PAGES: "5"
           NYC_SLEEP_SECONDS: "0.25"
+          NYC_MIN_SCORE: "40"
+          NYC_DISCOVERY_MODE: "true"
         run: |
           python scripts/nyc/nyc_run.py
