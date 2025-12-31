@@ -15,10 +15,8 @@ from google.oauth2.service_account import Credentials
 ALLOWED_NAICS = {"238210", "236220", "237310", "238220", "238120"}
 
 # NYC Open Data datasets (Socrata IDs)
-# DOB NOW: Build – Job Application Filings
-DATASET_JOB_FILINGS = "w9ak-ipjd"
-# DOB NOW: Build – Approved Permits
-DATASET_APPROVED_PERMITS = "rbx6-tga4"
+DATASET_JOB_FILINGS = "w9ak-ipjd"     # DOB NOW: Build – Job Application Filings
+DATASET_APPROVED_PERMITS = "rbx6-tga4"  # DOB NOW: Build – Approved Permits
 
 
 def utc_now_str():
@@ -30,7 +28,6 @@ def normalize_str(x):
 
 
 def first_present(record: dict, candidates: list[str]) -> str:
-    """Return the first non-empty field found among candidate keys."""
     for k in candidates:
         v = record.get(k)
         if v is None:
@@ -42,17 +39,13 @@ def first_present(record: dict, candidates: list[str]) -> str:
 
 
 def socrata_get(dataset_id: str, where: str | None = None, limit: int = 2000, offset: int = 0) -> list[dict]:
-    """Fetch rows from NYC Open Data Socrata endpoint."""
     base = f"https://data.cityofnewyork.us/resource/{dataset_id}.json"
     headers = {}
     token = os.environ.get("NYC_SOCRATA_APP_TOKEN")
     if token:
         headers["X-App-Token"] = token
 
-    params = {
-        "$limit": limit,
-        "$offset": offset,
-    }
+    params = {"$limit": limit, "$offset": offset}
     if where:
         params["$where"] = where
 
@@ -79,24 +72,50 @@ def header_map(ws):
     headers = ws.row_values(1)
     if not headers:
         raise RuntimeError("Row 1 headers are empty. Paste your column headers in row 1.")
-    # map header->col_index (1-based)
     return {h: i + 1 for i, h in enumerate(headers)}
 
 
 def load_existing_award_ids(ws) -> set[str]:
-    """Read existing Award IDs to avoid duplicates."""
     col_values = ws.col_values(1)  # Column A expected Award ID
     return {v.strip() for v in col_values[1:] if v and v.strip()}
 
 
+def extract_award_id(record: dict) -> str:
+    """
+    Robust extraction of job identifier from Socrata records.
+    1) Try known common field names.
+    2) Fallback: heuristic search for a key containing 'job' and ('number'/'no'/'id') and a non-empty value.
+    """
+    # Common candidates seen across DOB datasets
+    explicit = [
+        "job__", "job_", "job", "job_number", "job_no", "jobno",
+        "job_filing_number", "job_filing_no", "jobfilingnumber",
+        "job_id", "jobid",
+        "application_number", "application_no",
+        "filing_number", "filing_no",
+    ]
+    v = first_present(record, explicit)
+    if v:
+        return v
+
+    # Heuristic
+    for k, val in record.items():
+        if val is None:
+            continue
+        sval = normalize_str(val)
+        if not sval:
+            continue
+
+        kl = k.lower()
+        if "job" in kl and ("number" in kl or kl.endswith("no") or kl.endswith("_no") or "id" in kl or "__" in kl):
+            return sval
+
+    return ""
+
+
 def infer_naics(job_record: dict, permit_record: dict | None) -> str:
-    """
-    Conservative NAICS inference.
-    You can refine mapping later once you inspect real field distributions.
-    """
     work_type = first_present(job_record, ["work_type", "job_type", "jobtype", "job_type_code"])
     permit_type = first_present(permit_record or {}, ["permit_type", "permit_subtype", "permittypename"]) if permit_record else ""
-
     text = f"{work_type} {permit_type}".lower()
 
     if "elect" in text:
@@ -122,10 +141,6 @@ def naics_description(naics: str) -> str:
 
 
 def score_and_quarter_start(job: dict, permit: dict | None) -> tuple[int, str, str]:
-    """
-    Returns: (score 0-100, start_date YYYY-MM-DD or "", rationale)
-    Start dates anchored: Q2=2026-04-01, Q3=2026-07-01, Q4=2026-10-01
-    """
     score = 0
     rationale_parts = []
 
@@ -232,23 +247,22 @@ def score_and_quarter_start(job: dict, permit: dict | None) -> tuple[int, str, s
 
 def build_links(award_id: str) -> tuple[str, str]:
     web_search = f"https://www.google.com/search?q={award_id}+site%3Adata.cityofnewyork.us"
-    award_link = f"https://data.cityofnewyork.us/resource/{DATASET_JOB_FILINGS}.json?$where=job__={award_id}"
+    award_link = f"https://data.cityofnewyork.us/resource/{DATASET_JOB_FILINGS}.json?$limit=1&$where=contains(cast({award_id} as text),'')"
     return award_link, web_search
 
 
 def main():
-    # Sheet env
     sheet_id = os.environ.get("NYC_SHEET_ID")
     tab_name = os.environ.get("NYC_TAB_NAME")
     if not sheet_id or not tab_name:
         raise RuntimeError("Missing NYC_SHEET_ID or NYC_TAB_NAME")
 
     batch_size = int(os.environ.get("NYC_BATCH_SIZE", "200"))
-    max_pages = int(os.environ.get("NYC_MAX_PAGES", "5"))  # safety cap
+    max_pages = int(os.environ.get("NYC_MAX_PAGES", "5"))
     sleep_seconds = float(os.environ.get("NYC_SLEEP_SECONDS", "0.25"))
 
-    # Discovery controls
-    min_score = int(os.environ.get("NYC_MIN_SCORE", "70"))  # use 40 in discovery mode
+    # Discovery controls (these only affect filtering, not extraction)
+    min_score = int(os.environ.get("NYC_MIN_SCORE", "70"))
     discovery_mode = os.environ.get("NYC_DISCOVERY_MODE", "false").lower() == "true"
 
     # Debug counters
@@ -267,19 +281,26 @@ def main():
     hmap = header_map(ws)
     existing_ids = load_existing_award_ids(ws)
 
-    # 2) Pull approved permits and index by job number
+    # 2) Pull permits and index by award id (using robust extraction)
     permits_by_job = {}
     for page in range(max_pages):
         rows = socrata_get(DATASET_APPROVED_PERMITS, where=None, limit=batch_size, offset=page * batch_size)
         if not rows:
             break
+
+        # Print sample permit keys once (helps identify correct join key)
+        if page == 0 and rows:
+            print("---- SAMPLE PERMIT RECORD KEYS (first record) ----")
+            print(sorted(list(rows[0].keys())))
+
         for r in rows:
-            job_no = first_present(r, ["job__", "job_number", "jobno", "job"])
-            if job_no:
-                permits_by_job[job_no] = r
+            pid = extract_award_id(r)
+            if pid:
+                permits_by_job[pid] = r
+
         time.sleep(sleep_seconds)
 
-    # 3) Pull job filings and create rows
+    # 3) Pull filings and build rows
     rows_to_append = []
     now = utc_now_str()
 
@@ -290,8 +311,15 @@ def main():
 
         c_jobs_pulled += len(jobs)
 
+        # Print sample job keys once
+        if page == 0 and jobs:
+            print("---- SAMPLE JOB RECORD KEYS (first record) ----")
+            print(sorted(list(jobs[0].keys())))
+            print("---- SAMPLE JOB RECORD (first record) ----")
+            print(jobs[0])
+
         for job in jobs:
-            award_id = first_present(job, ["job__", "job_number", "jobno", "job"])
+            award_id = extract_award_id(job)
             if not award_id:
                 continue
             c_with_award_id += 1
@@ -302,7 +330,6 @@ def main():
 
             permit = permits_by_job.get(award_id)
 
-            # NAICS inference + filter
             naics = infer_naics(job, permit)
             if naics not in ALLOWED_NAICS:
                 continue
@@ -310,13 +337,11 @@ def main():
 
             score, start_date, rationale = score_and_quarter_start(job, permit)
 
-            # Score threshold (min_score: 70 normally, lower during discovery)
             if score >= min_score:
                 c_scored_ge_min += 1
             else:
                 continue
 
-            # Discovery mode: if no Start Date assigned, force Q3 2026 just to inspect intake
             if discovery_mode and not start_date:
                 start_date = "2026-07-01"
                 rationale = rationale + "; discovery_mode_forced_Q3_2026"
@@ -355,7 +380,6 @@ def main():
                 "Award Link": award_link,
                 "Recipient Profile Link": "",
                 "Web Search Link": web_search,
-                # Enrichment columns left blank for now
                 "Company Website": "",
                 "Company Phone": "",
                 "Company General Email": "",
@@ -363,7 +387,6 @@ def main():
                 "Responsible Person Role": "",
                 "Responsible Person Email": "",
                 "Responsible Person Phone": "",
-                # Tracking/scoring
                 "job_type": first_present(job, ["job_type", "jobtype", "work_type"]),
                 "job_status": first_present(job, ["job_status", "status", "jobstatus"]),
                 "filed_date": first_present(job, ["filing_date", "filed_date", "application_date", "date_filed"]),
@@ -387,7 +410,6 @@ def main():
 
         time.sleep(sleep_seconds)
 
-    # 4) Append + print debug
     if rows_to_append:
         ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
         c_appended = len(rows_to_append)
