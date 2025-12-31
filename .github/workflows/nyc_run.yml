@@ -1,0 +1,36 @@
+name: NYC - Pull DOB NOW jobs into Google Sheet
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * 1"  # Mondays 07:00 UTC
+
+jobs:
+  nyc-run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run NYC pipeline
+        env:
+          NYC_GOOGLE_CREDENTIALS_JSON: ${{ secrets.NYC_GOOGLE_CREDENTIALS_JSON }}
+          NYC_SHEET_ID: ${{ secrets.NYC_SHEET_ID }}
+          NYC_TAB_NAME: ${{ secrets.NYC_TAB_NAME }}
+          NYC_SOCRATA_APP_TOKEN: ${{ secrets.NYC_SOCRATA_APP_TOKEN }}
+          NYC_BATCH_SIZE: "200"
+          NYC_MAX_PAGES: "5"
+          NYC_SLEEP_SECONDS: "0.25"
+        run: |
+          python scripts/nyc/nyc_run.py
