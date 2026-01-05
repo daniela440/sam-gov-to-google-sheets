@@ -276,6 +276,10 @@ def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tu
     - Otherwise, if a results table exists on the returned page, results_html_bytes is set.
     - If maintenance/no-data page, both will be None (caller should exit cleanly).
     """
+
+    # Step 0: GET page
+    r0 = session.get(CSLB_LIST_BY_COUNTY_URL, timeout=timeout)
+    r0.raise_for_status()
     debug_dump_html("GET page", r0.text)
 
     if is_maintenance_or_no_data_page(r0.text):
@@ -293,24 +297,33 @@ def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tu
 
     # Step 1: Apply filters (so the results table/export becomes available)
     post_items = list(form_fields.items())
+
     for c in TARGET_CLASSIFICATIONS:
         post_items.append((class_select_name, c))
+
     post_items.append((county_select_name, TARGET_COUNTY))
 
     if submit_name:
+        # Some ASP.NET forms care about the submit button name being present
         post_items.append((submit_name, "Search"))
     else:
         # Generic ASP.NET postback
         post_items.append(("__EVENTTARGET", ""))
         post_items.append(("__EVENTARGUMENT", ""))
 
-   debug_dump_html("POST filters", r1.text)
-debug_dump_html("POST filters", r1.text)
+    r1 = session.post(
+        CSLB_LIST_BY_COUNTY_URL,
+        data=post_items,
+        timeout=timeout,
+        headers={"Referer": CSLB_LIST_BY_COUNTY_URL},
+    )
+    r1.raise_for_status()
+    debug_dump_html("POST filters", r1.text)
 
     if is_maintenance_or_no_data_page(r1.text):
         return None, None
 
-    # Step 2: Try to trigger Excel export via postback
+    # Step 2: Try to trigger Excel export via postback (if present)
     pb = _find_excel_postback_target(r1.text)
     if pb:
         target, arg = pb
@@ -319,23 +332,33 @@ debug_dump_html("POST filters", r1.text)
 
         export_items = list(form_fields_2.items())
         export_items.append(("__EVENTTARGET", target))
-        export_items.append(("__EVENTARGUMENT", arg))
+        export_items.append(("__EVENTARGUMENT", arg or ""))
 
-        r2 = session.post(CSLB_LIST_BY_COUNTY_URL, data=export_items, timeout=timeout)
+        r2 = session.post(
+            CSLB_LIST_BY_COUNTY_URL,
+            data=export_items,
+            timeout=timeout,
+            headers={"Referer": CSLB_LIST_BY_COUNTY_URL},
+        )
         r2.raise_for_status()
 
         # If we got an actual file (not HTML), return it
         ct = (r2.headers.get("Content-Type") or "").lower()
-        if ("excel" in ct) or ("spreadsheet" in ct) or ("application/octet-stream" in ct) or _looks_like_xls(r2.content) or _looks_like_xlsx(r2.content):
+        if (
+            ("excel" in ct)
+            or ("spreadsheet" in ct)
+            or ("application/octet-stream" in ct)
+            or _looks_like_xls(r2.content)
+            or _looks_like_xlsx(r2.content)
+        ):
             return r2.content, None
 
-        # If it's HTML but includes a table, we'll fall back to table parse
+        # If it's HTML but includes a table, fall back to table parse
         if _looks_like_html(r2.content):
             return None, r2.content
 
     # No export found; attempt to parse results table from r1
     return None, r1.content
-
 
 # =============================
 # Parsers
