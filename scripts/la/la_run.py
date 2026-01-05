@@ -225,6 +225,47 @@ def _find_excel_postback_target(html: str) -> Optional[Tuple[str, str]]:
             return m.group(1), m.group(2)
 
     return None
+def debug_dump_html(label: str, html: str) -> None:
+    try:
+        soup = BeautifulSoup(html or "", "lxml")
+        title = soup.title.get_text(" ", strip=True) if soup.title else ""
+        tables = soup.find_all("table")
+        selects = soup.find_all("select")
+
+        max_tr = 0
+        if tables:
+            max_tr = max(len(t.find_all("tr")) for t in tables)
+
+        print("---- CSLB DEBUG ----")
+        print(f"[{label}] title={title!r}")
+        print(f"[{label}] maintenance_detected={is_maintenance_or_no_data_page(html)}")
+        print(f"[{label}] html_len={len(html or ''):,}")
+        print(f"[{label}] tables_count={len(tables)} max_table_tr={max_tr}")
+        print(f"[{label}] selects_count={len(selects)}")
+
+        if selects:
+            # show select names (helps confirm correct field keys)
+            names = []
+            for s in selects[:12]:
+                nm = normalize_str(s.get("name") or s.get("id") or "")
+                if nm:
+                    names.append(nm)
+            print(f"[{label}] select_names_sample={names}")
+
+        # Snippet around common keywords
+        lowered = (html or "").lower()
+        for kw in ["no records", "no results", "validation", "error", "results", "download", "export", "excel", "__dopostback"]:
+            idx = lowered.find(kw)
+            if idx != -1:
+                start = max(0, idx - 120)
+                end = min(len(html), idx + 300)
+                snippet = re.sub(r"\s+", " ", (html[start:end]))
+                print(f"[{label}] snippet_near_{kw!r}: {snippet[:420]}")
+                break  # just show first match to keep logs readable
+
+        print("---- END CSLB DEBUG ----")
+    except Exception as e:
+        print(f"[{label}] debug_dump_html failed: {e}")
 
 
 def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tuple[Optional[bytes], Optional[bytes]]:
@@ -235,8 +276,7 @@ def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tu
     - Otherwise, if a results table exists on the returned page, results_html_bytes is set.
     - If maintenance/no-data page, both will be None (caller should exit cleanly).
     """
-    r0 = session.get(CSLB_LIST_BY_COUNTY_URL, timeout=timeout)
-    r0.raise_for_status()
+    debug_dump_html("GET page", r0.text)
 
     if is_maintenance_or_no_data_page(r0.text):
         return None, None
@@ -264,8 +304,8 @@ def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tu
         post_items.append(("__EVENTTARGET", ""))
         post_items.append(("__EVENTARGUMENT", ""))
 
-    r1 = session.post(CSLB_LIST_BY_COUNTY_URL, data=post_items, timeout=timeout)
-    r1.raise_for_status()
+   debug_dump_html("POST filters", r1.text)
+debug_dump_html("POST filters", r1.text)
 
     if is_maintenance_or_no_data_page(r1.text):
         return None, None
