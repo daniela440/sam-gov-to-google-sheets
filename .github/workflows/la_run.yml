@@ -1,4 +1,4 @@
-name: LA - Google Sheet Connectivity Test
+name: LA - Pull LADBS Permits into Google Sheet
 
 on:
   workflow_dispatch:
@@ -21,10 +21,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run connectivity test
+      - name: Run LA pipeline
         env:
           LA_GOOGLE_CREDENTIALS_JSON: ${{ secrets.LA_GOOGLE_CREDENTIALS_JSON }}
+          # Optional; improves Socrata rate limits if you add it later
+          LA_SOCRATA_APP_TOKEN: ${{ secrets.LA_SOCRATA_APP_TOKEN }}
+
           LA_SHEET_ID: 1uXC-sW0xnJe1erIbuEYFM7R6cyeq7NFWPCfWCjEr8Ug
           LA_TAB_NAME: Awards_Raw_LA
+
+          # Safety limits (as you requested)
+          LA_MAX_NEW: "10"
+          LA_SLEEP_SECONDS: "1.0"
+
+          # Filter controls
+          LA_ISSUE_YEAR: "2025"
+          LA_MIN_VALUATION: "50000"
         run: |
           python scripts/la/la_run.py
