@@ -160,14 +160,13 @@ def _find_select_name_by_contains(soup: BeautifulSoup, must_contain: str) -> Opt
 
 
 def _guess_class_and_county_select_names(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str]]:
-    # Try to find names that contain "class" and "county"
+    # Prefer explicit names
     class_name = _find_select_name_by_contains(soup, "class")
     county_name = _find_select_name_by_contains(soup, "county")
-
     if class_name and county_name:
         return class_name, county_name
 
-    # Fallback to first two selects if heuristic fails
+    # Fallback
     selects = soup.find_all("select")
     if len(selects) >= 2:
         return selects[0].get("name"), selects[1].get("name")
@@ -175,19 +174,46 @@ def _guess_class_and_county_select_names(soup: BeautifulSoup) -> Tuple[Optional[
     return None, None
 
 
-def _find_button_name_by_value(soup: BeautifulSoup, value_contains: str) -> Optional[str]:
-    for inp in soup.find_all("input"):
-        if normalize_str(inp.get("type")).lower() == "submit":
-            val = normalize_str(inp.get("value"))
-            if value_contains.lower() in val.lower():
-                return inp.get("name")
-    return None
+def _find_excel_postback_target(html: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Find __doPostBack('TARGET','ARG') used by the Excel export control.
+    """
+    if not html:
+        return None, None
+
+    matches = list(re.finditer(r"__doPostBack\('([^']+)','([^']*)'\)", html))
+    if not matches:
+        return None, None
+
+    # Prefer targets containing "excel"
+    for m in matches:
+        tgt, arg = m.group(1), m.group(2)
+        if "excel" in tgt.lower():
+            return tgt, arg
+
+    # Otherwise pick one that has excel/xls nearby
+    for m in matches:
+        start = max(0, m.start() - 250)
+        end = min(len(html), m.end() + 250)
+        context = html[start:end].lower()
+        if "excel" in context or "xls" in context:
+            return m.group(1), m.group(2)
+
+    return None, None
 
 
-def download_cslb_list_by_county(session: requests.Session, classifications: List[str], counties: List[str], timeout: int = 60) -> bytes:
+def download_cslb_list_by_county(
+    session: requests.Session,
+    classifications: List[str],
+    counties: List[str],
+    timeout: int = 60
+) -> bytes:
+    # 1) GET (captures cookies + VIEWSTATE)
     r0 = session.get(CSLB_LIST_BY_COUNTY_URL, timeout=timeout)
     r0.raise_for_status()
-    soup0 = BeautifulSoup(r0.text, "lxml")
+
+    html0 = r0.text
+    soup0 = BeautifulSoup(html0, "lxml")
 
     form_fields = _extract_aspnet_form_fields(soup0)
     class_select_name, county_select_name = _guess_class_and_county_select_names(soup0)
@@ -195,27 +221,47 @@ def download_cslb_list_by_county(session: requests.Session, classifications: Lis
     if not class_select_name or not county_select_name:
         raise RuntimeError("Could not locate classification/county select fields on CSLB page (page structure changed).")
 
-    # The CSLB page often has a dedicated download button. We try to find a submit button with "Excel" in it.
-    download_btn_name = _find_button_name_by_value(soup0, "excel")
+    # 2) Find Excel export postback target
+    excel_target, excel_arg = _find_excel_postback_target(html0)
+    if not excel_target:
+        snippet = re.sub(r"\s+", " ", html0[:800])
+        raise RuntimeError(
+            "Could not find Excel export postback target on CSLB page. "
+            f"Page snippet: {snippet}"
+        )
 
-    # Build POST list (multi-select = repeated keys)
+    # 3) Build POST data (multi-select = repeated keys)
     post_items = list(form_fields.items())
     for c in classifications:
         post_items.append((class_select_name, c))
     for cty in counties:
         post_items.append((county_select_name, cty))
 
-    # If we found an Excel button, include it; otherwise, submit generic
-    if download_btn_name:
-        post_items.append((download_btn_name, "Excel"))
-    else:
-        # generic fallback: trigger postback
-        post_items.append(("__EVENTTARGET", ""))
-        post_items.append(("__EVENTARGUMENT", ""))
+    # Trigger Excel export
+    post_items.append(("__EVENTTARGET", excel_target))
+    post_items.append(("__EVENTARGUMENT", excel_arg or ""))
 
-    r1 = session.post(CSLB_LIST_BY_COUNTY_URL, data=post_items, timeout=timeout)
+    # 4) POST
+    r1 = session.post(
+        CSLB_LIST_BY_COUNTY_URL,
+        data=post_items,
+        timeout=timeout,
+        headers={"Referer": CSLB_LIST_BY_COUNTY_URL, "User-Agent": "Mozilla/5.0"},
+    )
     r1.raise_for_status()
-    return r1.content
+
+    data = r1.content
+
+    # If it returned HTML again, export did not fire (validation, wrong target, etc.)
+    if _looks_like_html(data) and not _looks_like_xls(data) and not _looks_like_xlsx(data):
+        text = data.decode("utf-8", errors="ignore")
+        snippet = re.sub(r"\s+", " ", text[:1000])
+        raise RuntimeError(
+            "CSLB returned HTML instead of an Excel file after export postback. "
+            f"Snippet: {snippet}"
+        )
+
+    return data
 
 
 # =============================
@@ -227,7 +273,6 @@ def _looks_like_xlsx(b: bytes) -> bool:
 
 
 def _looks_like_xls(b: bytes) -> bool:
-    # OLE header: D0 CF 11 E0 A1 B1 1A E1
     return len(b) >= 8 and b[0:8] == bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])
 
 
@@ -250,7 +295,6 @@ def parse_excel_xlsx(x: bytes) -> List[Dict[str, str]]:
             continue
         if not any(values):
             continue
-        # pad/truncate
         if len(values) < len(headers):
             values += [""] * (len(headers) - len(values))
         out.append({headers[i]: values[i] for i in range(min(len(headers), len(values)))})
@@ -281,8 +325,7 @@ def parse_html_table(x: bytes) -> List[Dict[str, str]]:
     soup = BeautifulSoup(text, "lxml")
     table = soup.find("table")
     if not table:
-        # show a short snippet to help debugging if CSLB returned an error page
-        snippet = re.sub(r"\s+", " ", text[:400])
+        snippet = re.sub(r"\s+", " ", text[:1000])
         raise RuntimeError(f"CSLB response was HTML but contained no table. Snippet: {snippet}")
 
     first_row = table.find("tr")
@@ -308,8 +351,6 @@ def parse_cslb_download(data: bytes) -> List[Dict[str, str]]:
         return parse_excel_xls(data)
     if _looks_like_html(data):
         return parse_html_table(data)
-
-    # Unknown
     sniff = data[:40]
     raise RuntimeError(f"Unknown CSLB download format. First 40 bytes: {sniff!r}")
 
@@ -381,7 +422,6 @@ def main():
     enable_ddg = os.environ.get("LA_ENABLE_DDG", "true").lower() == "true"
     ddg_cap = int(os.environ.get("LA_DDG_DAILY_CAP", "10"))
 
-    # Connect sheet
     gc = get_gspread_client()
     sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(tab_name)
@@ -406,7 +446,6 @@ def main():
     ddg_used = 0
     appended = 0
 
-    # Helper to get column case-insensitively
     def col(row: dict, candidates: List[str]) -> str:
         lower_map = {k.lower(): k for k in row.keys()}
         for c in candidates:
@@ -454,8 +493,6 @@ def main():
         hq_addr = safe_join([address, city, state, zip_code], sep=", ").replace(", ,", ",").strip(", ").strip()
         recipient_id = hashlib.md5(award_id.encode("utf-8")).hexdigest()
 
-        # For consistency with your downstream system, keep a 2026 start anchor.
-        # (No permit dates exist in this CSLB list feed.)
         start_date = "2026-07-01"
 
         recipient_profile = "https://www.cslb.ca.gov/OnlineServices/CheckLicenseII/CheckLicense.aspx"
@@ -513,7 +550,7 @@ def main():
         ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
         print(f"✅ Appended {len(rows_to_append)} rows into {tab_name}.")
     else:
-        print("No rows appended. If this happens, the CSLB output headers may differ from our column candidates.")
+        print("No rows appended. If this happens, CSLB output headers may differ from our column candidates.")
 
     print(f"DDG used: {ddg_used} (cap={ddg_cap})")
     print("Done.")
