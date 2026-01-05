@@ -6,7 +6,6 @@ import re
 import io
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional
-from urllib.parse import urljoin
 
 import requests
 import gspread
@@ -21,25 +20,27 @@ import xlrd      # .xls (BIFF)
 # CONFIG
 # =============================
 
-CSLB_LIST_BY_COUNTY_URL = "https://www.cslb.ca.gov/onlineservices/dataportal/ListByCounty"
+CSLB_LIST_BY_COUNTY_URL = "https://www.cslb.ca.gov/onlineservices/dataportal/ListByCounty.aspx"
 
+# Your NAICS allowlist
 ALLOWED_NAICS = {"238210", "236220", "237310", "238220", "238120"}
 
-TARGET_COUNTY_TEXT = "Los Angeles"
+# LA County only
+TARGET_COUNTY = "Los Angeles"
 
-# <=10 classifications (your constraint)
-TARGET_CLASSIFICATIONS_TEXT = ["A", "B", "C-10", "C-20", "C-36", "C-4", "C-32", "C-51", "C-50"]
+# <= 10 classifications (mapped to your NAICS set)
+TARGET_CLASSIFICATIONS = ["A", "B", "C-10", "C-20", "C-36", "C-4", "C-32", "C-51", "C-50"]
 
 CLASS_TO_NAICS = {
-    "C-10": "238210",
-    "C-20": "238220",
-    "C-36": "238220",
-    "C-4":  "238220",
-    "C-51": "238120",
-    "C-50": "238120",
-    "A":    "237310",
-    "C-32": "237310",
-    "B":    "236220",
+    "C-10": "238210",  # Electrical
+    "C-20": "238220",  # HVAC
+    "C-36": "238220",  # Plumbing
+    "C-4":  "238220",  # Boiler/Hot Water Heating
+    "C-51": "238120",  # Structural Steel
+    "C-50": "238120",  # Steel/Rebar
+    "A":    "237310",  # Engineering -> roads/bridge proxy
+    "C-32": "237310",  # Parking/Landscaping -> civil proxy (kept per your earlier mapping)
+    "B":    "236220",  # General Building
 }
 
 NAICS_DESC = {
@@ -50,9 +51,27 @@ NAICS_DESC = {
     "238120": "Structural Steel and Precast Concrete Contractors",
 }
 
+DDG_BLOCKLIST = (
+    "duckduckgo.com",
+    "google.com",
+    "bing.com",
+    "yahoo.com",
+    "facebook.com",
+    "instagram.com",
+    "linkedin.com",
+    "yelp.com",
+    "yellowpages.com",
+    "bbb.org",
+    "opencorporates.com",
+    "dnb.com",
+    "zoominfo.com",
+    "mapquest.com",
+    "wikipedia.org",
+)
+
 
 # =============================
-# General helpers
+# Helpers
 # =============================
 
 def utc_now_str() -> str:
@@ -93,10 +112,6 @@ def get_gspread_client():
     return gspread.authorize(credentials)
 
 
-# =============================
-# DuckDuckGo website enrichment
-# =============================
-
 def ddg_find_website(query: str, timeout: int = 30) -> str:
     q = normalize_str(query)
     if not q:
@@ -112,30 +127,12 @@ def ddg_find_website(query: str, timeout: int = 30) -> str:
     if not links:
         return ""
 
-    blocklist = (
-        "duckduckgo.com",
-        "google.com",
-        "bing.com",
-        "yahoo.com",
-        "facebook.com",
-        "instagram.com",
-        "linkedin.com",
-        "yelp.com",
-        "yellowpages.com",
-        "bbb.org",
-        "opencorporates.com",
-        "dnb.com",
-        "zoominfo.com",
-        "mapquest.com",
-        "wikipedia.org",
-    )
-
     def clean(u: str) -> str:
         return u.replace("&amp;", "&").strip()
 
     for u in links:
         u = clean(u)
-        if any(b in u.lower() for b in blocklist):
+        if any(b in u.lower() for b in DDG_BLOCKLIST):
             continue
         m = re.match(r"^(https?://[^/]+)", u)
         return m.group(1) if m else u
@@ -143,233 +140,178 @@ def ddg_find_website(query: str, timeout: int = 30) -> str:
     return ""
 
 
+def is_maintenance_or_no_data_page(html: str) -> bool:
+    t = (html or "").lower()
+    signals = [
+        "database is unavailable",
+        "scheduled maintenance",
+        "please note:",
+        "unavailable sundays",
+        "temporarily unavailable",
+        "service is currently unavailable",
+    ]
+    return any(s in t for s in signals)
+
+
 # =============================
-# CSLB ASP.NET + export discovery
+# CSLB portal interaction (ASP.NET)
 # =============================
 
-def _extract_hidden_inputs(soup: BeautifulSoup) -> Dict[str, str]:
+def _extract_aspnet_form_fields(soup: BeautifulSoup) -> Dict[str, str]:
     fields = {}
     for inp in soup.select("input"):
         name = inp.get("name")
         if not name:
             continue
-        t = normalize_str(inp.get("type")).lower()
-        if t in ("hidden", "submit", "text", "search", ""):
-            fields[name] = inp.get("value", "")
+        fields[name] = inp.get("value", "")
     return fields
 
 
-def _find_select_by_keywords(soup: BeautifulSoup, keywords: List[str]) -> Optional[BeautifulSoup]:
+def _find_select_name_by_contains(soup: BeautifulSoup, must_contain: str) -> Optional[str]:
     for sel in soup.find_all("select"):
-        name = normalize_str(sel.get("name") or "")
-        sid = normalize_str(sel.get("id") or "")
-        blob = f"{name} {sid}".lower()
-        if any(k.lower() in blob for k in keywords):
-            return sel
+        name = normalize_str(sel.get("name"))
+        if must_contain.lower() in name.lower():
+            return name
     return None
 
 
-def _option_value_for_text(select_tag: BeautifulSoup, wanted_text: str) -> Optional[str]:
-    wt = wanted_text.strip().lower()
-    for opt in select_tag.find_all("option"):
-        txt = normalize_str(opt.get_text(" ", strip=True)).lower()
-        if txt == wt:
-            return opt.get("value")
-    for opt in select_tag.find_all("option"):
-        txt = normalize_str(opt.get_text(" ", strip=True)).lower()
-        if wt in txt:
-            return opt.get("value")
-    return None
+def _guess_class_and_county_select_names(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str]]:
+    class_name = _find_select_name_by_contains(soup, "class")
+    county_name = _find_select_name_by_contains(soup, "county")
+    if class_name and county_name:
+        return class_name, county_name
+
+    # fallback: first two selects
+    selects = soup.find_all("select")
+    if len(selects) >= 2:
+        return selects[0].get("name"), selects[1].get("name")
+    return None, None
 
 
-def _pick_search_submit_name(soup: BeautifulSoup) -> Optional[str]:
+def _find_submit_button_name(soup: BeautifulSoup) -> Optional[str]:
+    # Prefer a button that looks like "Search" / "Submit" / "View"
     for inp in soup.find_all("input"):
         if normalize_str(inp.get("type")).lower() != "submit":
             continue
         val = normalize_str(inp.get("value")).lower()
-        if any(k in val for k in ["search", "view", "submit", "run", "go"]):
+        if any(x in val for x in ["search", "submit", "view", "show", "go"]):
+            return inp.get("name")
+    # fallback: any submit
+    for inp in soup.find_all("input"):
+        if normalize_str(inp.get("type")).lower() == "submit":
             return inp.get("name")
     return None
 
 
-def _find_download_link(html: str, base_url: str) -> Optional[str]:
+def _find_excel_postback_target(html: str) -> Optional[Tuple[str, str]]:
     """
-    After applying filters, CSLB may render a direct link to an .xls/.xlsx/.csv file.
-    This is more reliable than hunting for __doPostBack.
+    Try to locate a __doPostBack('TARGET','ARG') call associated with Excel export.
+    Returns (TARGET, ARG) if found.
     """
-    soup = BeautifulSoup(html, "lxml")
-
-    candidates = []
-    for a in soup.find_all("a", href=True):
-        href = normalize_str(a["href"])
-        text = normalize_str(a.get_text(" ", strip=True)).lower()
-        hlow = href.lower()
-
-        # Strong signals: actual file link
-        if any(ext in hlow for ext in [".xls", ".xlsx", ".csv"]):
-            candidates.append((10, href, text))
-            continue
-
-        # Medium signals: "download" or "excel" in href/text
-        score = 0
-        if "download" in hlow or "export" in hlow:
-            score += 6
-        if "excel" in hlow or "xls" in hlow:
-            score += 6
-        if "download" in text or "export" in text or "excel" in text:
-            score += 4
-        if score > 0:
-            candidates.append((score, href, text))
-
+    # First pass: look for doPostBack calls and pick ones whose arg or surrounding mentions Excel
+    candidates = re.findall(r"__doPostBack\('([^']+)'\s*,\s*'([^']*)'\)", html, flags=re.IGNORECASE)
     if not candidates:
         return None
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    best_href = candidates[0][1]
-    return urljoin(base_url, best_href)
+    # If any arg explicitly contains "excel", take it
+    for target, arg in candidates:
+        if "excel" in (arg or "").lower():
+            return target, arg
+
+    # Otherwise look for the word excel near the call (rough heuristic)
+    for m in re.finditer(r"__doPostBack\('([^']+)'\s*,\s*'([^']*)'\)", html, flags=re.IGNORECASE):
+        window = html[max(0, m.start() - 120): m.end() + 120].lower()
+        if "excel" in window or ".xls" in window or "export" in window:
+            return m.group(1), m.group(2)
+
+    return None
 
 
-def _extract_postbacks(html: str) -> List[Tuple[str, str, str]]:
-    out = []
-    for m in re.finditer(r"__doPostBack\('([^']+)','([^']*)'\)", html):
-        target, arg = m.group(1), m.group(2)
-        start = max(0, m.start() - 200)
-        end = min(len(html), m.end() + 200)
-        ctx = html[start:end]
-        out.append((target, arg, ctx))
-    return out
-
-
-def _pick_export_postback(html: str) -> Optional[Tuple[str, str]]:
-    cands = _extract_postbacks(html)
-    best = None
-    best_score = 0
-    for target, arg, ctx in cands:
-        ctx_l = ctx.lower()
-        score = 0
-        if "excel" in ctx_l or ".xls" in ctx_l or "xls" in ctx_l:
-            score += 10
-        if "export" in ctx_l or "download" in ctx_l:
-            score += 6
-        if score > best_score:
-            best_score = score
-            best = (target, arg)
-    return best
-
-
-def _download_cslb_export(session: requests.Session, timeout: int = 60) -> bytes:
+def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tuple[Optional[bytes], Optional[bytes]]:
     """
-    1) GET page
-    2) POST with selected county/classifications (+search if present)
-    3) Prefer direct download link (.xls/.csv) if present
-    4) Else fallback to __doPostBack export target
+    Returns (download_bytes, results_html_bytes)
+
+    - If we can trigger an export/download, download_bytes is set.
+    - Otherwise, if a results table exists on the returned page, results_html_bytes is set.
+    - If maintenance/no-data page, both will be None (caller should exit cleanly).
     """
     r0 = session.get(CSLB_LIST_BY_COUNTY_URL, timeout=timeout)
     r0.raise_for_status()
 
-    html0 = r0.text
-    soup0 = BeautifulSoup(html0, "lxml")
+    if is_maintenance_or_no_data_page(r0.text):
+        return None, None
 
-    class_sel = _find_select_by_keywords(soup0, ["class"])
-    county_sel = _find_select_by_keywords(soup0, ["county"])
-    if not class_sel or not county_sel:
-        snippet = re.sub(r"\s+", " ", html0[:600])
-        raise RuntimeError(f"Could not locate class/county selects. Snippet: {snippet}")
+    soup0 = BeautifulSoup(r0.text, "lxml")
+    form_fields = _extract_aspnet_form_fields(soup0)
 
-    class_name = class_sel.get("name")
-    county_name = county_sel.get("name")
-    if not class_name or not county_name:
-        raise RuntimeError("Class/county selects missing name attribute (page changed).")
+    class_select_name, county_select_name = _guess_class_and_county_select_names(soup0)
+    if not class_select_name or not county_select_name:
+        # If structure changed or degraded, exit cleanly
+        return None, None
 
-    county_val = _option_value_for_text(county_sel, TARGET_COUNTY_TEXT)
-    if not county_val:
-        raise RuntimeError(f"Could not find county '{TARGET_COUNTY_TEXT}' in CSLB options.")
+    submit_name = _find_submit_button_name(soup0)
 
-    class_vals = []
-    for ctext in TARGET_CLASSIFICATIONS_TEXT:
-        v = _option_value_for_text(class_sel, ctext)
-        if not v:
-            raise RuntimeError(f"Could not find classification '{ctext}' in CSLB options.")
-        class_vals.append(v)
+    # Step 1: Apply filters (so the results table/export becomes available)
+    post_items = list(form_fields.items())
+    for c in TARGET_CLASSIFICATIONS:
+        post_items.append((class_select_name, c))
+    post_items.append((county_select_name, TARGET_COUNTY))
 
-    fields0 = _extract_hidden_inputs(soup0)
-    post1 = list(fields0.items())
+    if submit_name:
+        post_items.append((submit_name, "Search"))
+    else:
+        # Generic ASP.NET postback
+        post_items.append(("__EVENTTARGET", ""))
+        post_items.append(("__EVENTARGUMENT", ""))
 
-    for v in class_vals:
-        post1.append((class_name, v))
-    post1.append((county_name, county_val))
-
-    search_btn = _pick_search_submit_name(soup0)
-    if search_btn:
-        post1.append((search_btn, "Search"))
-    post1.append(("__EVENTTARGET", ""))
-    post1.append(("__EVENTARGUMENT", ""))
-
-    r1 = session.post(CSLB_LIST_BY_COUNTY_URL, data=post1, timeout=timeout)
+    r1 = session.post(CSLB_LIST_BY_COUNTY_URL, data=post_items, timeout=timeout)
     r1.raise_for_status()
-    html1 = r1.text
 
-    # --- NEW: try direct download link first
-    direct = _find_download_link(html1, base_url=CSLB_LIST_BY_COUNTY_URL)
-    if direct:
-        rfile = session.get(direct, timeout=timeout)
-        rfile.raise_for_status()
-        content = rfile.content
-        # if still HTML, it wasn't a real file
-        head = content[:2000].lower()
-        if b"<html" in head or b"<!doctype" in head:
-            snippet = re.sub(r"\s+", " ", content.decode("utf-8", errors="ignore")[:700])
-            raise RuntimeError(f"CSLB direct download link returned HTML (not a file). Snippet: {snippet}")
-        return content
+    if is_maintenance_or_no_data_page(r1.text):
+        return None, None
 
-    # --- fallback: postback export
-    export_pb = _pick_export_postback(html1)
-    if not export_pb:
-        snippet = re.sub(r"\s+", " ", html1[:900])
-        raise RuntimeError(
-            "Could not locate a direct download link or Excel export postback after applying filters. "
-            f"Page snippet: {snippet}"
-        )
+    # Step 2: Try to trigger Excel export via postback
+    pb = _find_excel_postback_target(r1.text)
+    if pb:
+        target, arg = pb
+        soup1 = BeautifulSoup(r1.text, "lxml")
+        form_fields_2 = _extract_aspnet_form_fields(soup1)
 
-    export_target, export_arg = export_pb
-    soup1 = BeautifulSoup(html1, "lxml")
-    fields1 = _extract_hidden_inputs(soup1)
-    post2 = list(fields1.items())
+        export_items = list(form_fields_2.items())
+        export_items.append(("__EVENTTARGET", target))
+        export_items.append(("__EVENTARGUMENT", arg))
 
-    for v in class_vals:
-        post2.append((class_name, v))
-    post2.append((county_name, county_val))
+        r2 = session.post(CSLB_LIST_BY_COUNTY_URL, data=export_items, timeout=timeout)
+        r2.raise_for_status()
 
-    post2.append(("__EVENTTARGET", export_target))
-    post2.append(("__EVENTARGUMENT", export_arg or ""))
+        # If we got an actual file (not HTML), return it
+        ct = (r2.headers.get("Content-Type") or "").lower()
+        if ("excel" in ct) or ("spreadsheet" in ct) or ("application/octet-stream" in ct) or _looks_like_xls(r2.content) or _looks_like_xlsx(r2.content):
+            return r2.content, None
 
-    r2 = session.post(CSLB_LIST_BY_COUNTY_URL, data=post2, timeout=timeout)
-    r2.raise_for_status()
-    content = r2.content
+        # If it's HTML but includes a table, we'll fall back to table parse
+        if _looks_like_html(r2.content):
+            return None, r2.content
 
-    head = content[:2000].lower()
-    if b"<html" in head or b"<!doctype" in head:
-        snippet = re.sub(r"\s+", " ", content.decode("utf-8", errors="ignore")[:700])
-        raise RuntimeError(f"CSLB export postback returned HTML (not a file). Snippet: {snippet}")
-
-    return content
+    # No export found; attempt to parse results table from r1
+    return None, r1.content
 
 
 # =============================
-# Parse export bytes
+# Parsers
 # =============================
 
 def _looks_like_xlsx(b: bytes) -> bool:
-    return len(b) >= 2 and b[0:2] == b"PK"
+    return len(b) >= 2 and b[0:2] == b"PK"  # zip
 
 
 def _looks_like_xls(b: bytes) -> bool:
     return len(b) >= 8 and b[0:8] == bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])
 
 
-def _looks_like_csv(b: bytes) -> bool:
-    sample = b[:2000]
-    return (b"," in sample or b";" in sample) and (b"\n" in sample or b"\r" in sample)
+def _looks_like_html(b: bytes) -> bool:
+    t = b[:4000].lower()
+    return b"<html" in t or b"<!doctype html" in t or b"<table" in t
 
 
 def parse_excel_xlsx(x: bytes) -> List[Dict[str, str]]:
@@ -395,6 +337,7 @@ def parse_excel_xlsx(x: bytes) -> List[Dict[str, str]]:
 def parse_excel_xls(x: bytes) -> List[Dict[str, str]]:
     book = xlrd.open_workbook(file_contents=x)
     sheet = book.sheet_by_index(0)
+
     if sheet.nrows < 1:
         return []
 
@@ -410,41 +353,56 @@ def parse_excel_xls(x: bytes) -> List[Dict[str, str]]:
     return out
 
 
-def parse_csv_bytes(x: bytes) -> List[Dict[str, str]]:
-    import csv
+def parse_html_table(x: bytes) -> List[Dict[str, str]]:
     text = x.decode("utf-8", errors="ignore")
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    if not lines:
+    soup = BeautifulSoup(text, "lxml")
+
+    # Prefer the largest table (some pages have layout tables)
+    tables = soup.find_all("table")
+    if not tables:
         return []
-    reader = csv.DictReader(lines)
-    return [{k: normalize_str(v) for k, v in row.items()} for row in reader]
+
+    def table_size(tb):
+        return len(tb.find_all("tr"))
+
+    table = sorted(tables, key=table_size, reverse=True)[0]
+    rows = table.find_all("tr")
+    if not rows:
+        return []
+
+    headers = [normalize_str(cell.get_text(" ", strip=True)) for cell in rows[0].find_all(["th", "td"])]
+    if not headers or len(headers) < 2:
+        return []
+
+    out = []
+    for tr in rows[1:]:
+        cells = [normalize_str(td.get_text(" ", strip=True)) for td in tr.find_all(["td", "th"])]
+        if not cells or all(not c for c in cells):
+            continue
+        if len(cells) < len(headers):
+            cells += [""] * (len(headers) - len(cells))
+        out.append({headers[i]: cells[i] for i in range(min(len(headers), len(cells)))})
+    return out
 
 
-def parse_cslb_export(data: bytes) -> List[Dict[str, str]]:
-    if _looks_like_xlsx(data):
-        return parse_excel_xlsx(data)
-    if _looks_like_xls(data):
-        return parse_excel_xls(data)
-    if _looks_like_csv(data):
-        return parse_csv_bytes(data)
+def parse_cslb_payload(download_bytes: Optional[bytes], results_html_bytes: Optional[bytes]) -> List[Dict[str, str]]:
+    if download_bytes:
+        if _looks_like_xlsx(download_bytes):
+            return parse_excel_xlsx(download_bytes)
+        if _looks_like_xls(download_bytes):
+            return parse_excel_xls(download_bytes)
+        if _looks_like_html(download_bytes):
+            return parse_html_table(download_bytes)
 
-    sniff = data[:40]
-    raise RuntimeError(f"Unknown CSLB export format. First 40 bytes: {sniff!r}")
+    if results_html_bytes:
+        return parse_html_table(results_html_bytes)
+
+    return []
 
 
 # =============================
 # Mapping & filtering
 # =============================
-
-def _normalize_class_token(tok: str) -> str:
-    p = normalize_str(tok).upper()
-    if not p:
-        return ""
-    m = re.match(r"^(C)\s*-?\s*(\d+)$", p)
-    if m:
-        return f"C-{m.group(2)}"
-    return p
-
 
 def infer_naics_from_classifications(classifications_str: str) -> str:
     raw = normalize_str(classifications_str)
@@ -453,9 +411,13 @@ def infer_naics_from_classifications(classifications_str: str) -> str:
 
     tokens = []
     for part in re.split(r"[;,/|]\s*|\s{2,}", raw):
-        p = _normalize_class_token(part)
-        if p:
-            tokens.append(p)
+        p = normalize_str(part).upper()
+        if not p:
+            continue
+        m = re.match(r"^(C)\s*-?\s*(\d+)$", p)
+        if m:
+            p = f"C-{m.group(2)}"
+        tokens.append(p)
 
     priority = ["C-10", "C-36", "C-20", "C-4", "C-51", "C-50", "C-32", "A", "B"]
     token_set = set(tokens)
@@ -476,7 +438,7 @@ def confidence_for_row(status: str, phone: str) -> Tuple[int, str, str]:
     p = normalize_str(phone)
 
     score = 70
-    rationale = ["cslb_list_by_county(+70)"]
+    rationale = ["cslb_county_list(+70)"]
 
     if "active" in s:
         score += 15
@@ -499,12 +461,13 @@ def main():
     if not sheet_id or not tab_name:
         raise RuntimeError("Missing LA_SHEET_ID or LA_TAB_NAME")
 
-    max_new = int(os.environ.get("LA_MAX_NEW", "10"))
-    sleep_seconds = float(os.environ.get("LA_SLEEP_SECONDS", "1.0"))
+    max_new = int(os.environ.get("LA_MAX_NEW", "200"))
+    sleep_seconds = float(os.environ.get("LA_SLEEP_SECONDS", "0.2"))
 
     enable_ddg = os.environ.get("LA_ENABLE_DDG", "true").lower() == "true"
     ddg_cap = int(os.environ.get("LA_DDG_DAILY_CAP", "10"))
 
+    # Connect sheet
     gc = get_gspread_client()
     sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(tab_name)
@@ -514,18 +477,28 @@ def main():
     sess = requests.Session()
     sess.headers.update({"User-Agent": "Mozilla/5.0"})
 
-    print(f"Downloading CSLB export: county={TARGET_COUNTY_TEXT} classifications={TARGET_CLASSIFICATIONS_TEXT} ...")
-    payload = _download_cslb_export(session=sess)
-    print(f"Downloaded {len(payload):,} bytes from CSLB export.")
+    print(f"Downloading CSLB list (LA County only) for classifications={TARGET_CLASSIFICATIONS} ...")
+    download_bytes, results_html_bytes = download_or_results_html(session=sess)
 
-    rows = parse_cslb_export(payload)
-    print(f"Parsed {len(rows)} rows from CSLB export.")
+    # If maintenance/no-data page, exit cleanly (do not fail GitHub Action)
+    if download_bytes is None and results_html_bytes is None:
+        print("CSLB appears to be in maintenance / unavailable mode, or page structure is degraded.")
+        print("Exiting cleanly without appending rows. Re-run after maintenance window.")
+        return
+
+    rows = parse_cslb_payload(download_bytes, results_html_bytes)
+    print(f"Parsed {len(rows)} rows from CSLB payload.")
+
+    if not rows:
+        print("No parsable rows found (likely CSLB returned a page without results). Exiting cleanly.")
+        return
 
     now = utc_now_str()
     rows_to_append = []
     ddg_used = 0
     appended = 0
 
+    # Helper to get column case-insensitively
     def col(row: dict, candidates: List[str]) -> str:
         lower_map = {k.lower(): k for k in row.keys()}
         for c in candidates:
@@ -538,7 +511,7 @@ def main():
         if appended >= max_new:
             break
 
-        license_no = col(r, ["License Number", "License #", "License"])
+        license_no = col(r, ["License Number", "License #", "License", "Lic #", "Lic No", "License No"])
         if not license_no:
             continue
 
@@ -546,20 +519,20 @@ def main():
         if award_id in existing_ids:
             continue
 
-        business = col(r, ["Business Name", "Business"])
-        address = col(r, ["Address", "Street Address"])
-        phone = col(r, ["Telephone Number", "Phone", "Telephone"])
-        status = col(r, ["License Status", "Status"])
-        classifications = col(r, ["Classification(s)", "Classifications", "Classification"])
-
+        business = col(r, ["Business Name", "Business", "Contractor Name", "Company", "Name"])
+        address = col(r, ["Address", "Street Address", "Address Line 1"])
         city = col(r, ["City"])
         state = col(r, ["State"])
         zip_code = col(r, ["Zip", "Zip Code", "ZIP"])
+        phone = col(r, ["Telephone Number", "Phone", "Telephone", "Tel"])
+        status = col(r, ["License Status", "Status"])
+        classifications = col(r, ["Classification(s)", "Classifications", "Classification", "Class"])
 
         naics = infer_naics_from_classifications(classifications)
         if not naics or naics not in ALLOWED_NAICS:
             continue
 
+        # Keep only Active licenses
         if "active" not in normalize_str(status).lower():
             continue
 
@@ -567,18 +540,14 @@ def main():
         if enable_ddg and ddg_used < ddg_cap and business:
             website = ddg_find_website(f"{business} contractor Los Angeles County CA")
             ddg_used += 1
-            time.sleep(0.4)
+            time.sleep(0.40)
 
         score, rationale, conf_level = confidence_for_row(status=status, phone=phone)
 
-        if city or state or zip_code:
-            hq_addr = safe_join([address, city, state, zip_code], sep=", ").replace(", ,", ",").strip(", ").strip()
-        else:
-            hq_addr = address
-
+        hq_addr = safe_join([address, city, state, zip_code], sep=", ").replace(", ,", ",").strip(", ").strip()
         recipient_id = hashlib.md5(award_id.encode("utf-8")).hexdigest()
 
-        # Keep consistent downstream anchor
+        # Keep your downstream anchor
         start_date = "2026-07-01"
 
         recipient_profile = "https://www.cslb.ca.gov/OnlineServices/CheckLicenseII/CheckLicense.aspx"
@@ -600,7 +569,7 @@ def main():
             "Awarding Agency": "CSLB Public Data Portal (List by Classification & County)",
             "Place of Performance": "Los Angeles County, CA",
             "Description": f"CSLB licensed contractor in Los Angeles County. Classifications: {classifications}",
-            "Award Link": "",
+            "Award Link": "",  # CSLB export does not provide a stable per-license deep link in this feed
             "Recipient Profile Link": recipient_profile,
             "Web Search Link": web_search,
 
@@ -619,7 +588,7 @@ def main():
             "data_source": "CSLB Public Data Portal",
             "data_confidence_level": conf_level,
             "last_verified_date": now,
-            "notes": f"License {award_id}; Status={status}; County={TARGET_COUNTY_TEXT}",
+            "notes": f"License {award_id}; Status={status}; County={TARGET_COUNTY}",
         }
 
         ordered_row = [""] * len(hmap)
@@ -636,7 +605,7 @@ def main():
         ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
         print(f"✅ Appended {len(rows_to_append)} rows into {tab_name}.")
     else:
-        print("No rows appended. Either export headers changed or no matching rows were returned.")
+        print("No rows appended (after filters). This can happen if CSLB returned no Active rows for the classifications/county, or if columns differed.")
 
     print(f"DDG used: {ddg_used} (cap={ddg_cap})")
     print("Done.")
