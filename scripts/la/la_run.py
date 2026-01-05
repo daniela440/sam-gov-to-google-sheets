@@ -11,9 +11,10 @@ from google.oauth2.service_account import Credentials
 
 
 # -----------------------------
-# LADBS permits dataset (City of LA Open Data / Socrata)
+# LADBS dataset that includes contractor info
 # -----------------------------
-LADBS_DATASET_ID = "pi9x-tg5x"  # Building Permits Issued from 2020 to Present (N)
+# This replaces pi9x-tg5x (which lacks contractor/license fields).
+LADBS_DATASET_ID = "hbkd-qubn"  # LADBS-Permits (has contractor business name / license fields)
 
 
 # -----------------------------
@@ -29,7 +30,8 @@ def normalize_str(x) -> str:
 
 def first_present(record: dict, candidates: list[str]) -> str:
     for k in candidates:
-        v = normalize_str(record.get(k))
+        v = record.get(k)
+        v = normalize_str(v)
         if v:
             return v
     return ""
@@ -51,6 +53,16 @@ def month_of_iso(d: str) -> int | None:
         return int(d[5:7])
     except Exception:
         return None
+
+
+def to_float(x: str) -> float:
+    s = normalize_str(x)
+    if not s:
+        return 0.0
+    try:
+        return float(s.replace(",", "").replace("$", ""))
+    except Exception:
+        return 0.0
 
 
 # -----------------------------
@@ -85,8 +97,8 @@ def load_existing_award_ids(ws) -> set[str]:
 # -----------------------------
 # Socrata (SODA) client
 # -----------------------------
-def socrata_get(dataset_id: str, where: str | None, select: str | None, order: str | None, limit: int, offset: int) -> list[dict]:
-    base = f"https://data.lacity.org/resource/{dataset_id}.json"
+def socrata_get(domain: str, dataset_id: str, where: str | None, order: str | None, limit: int, offset: int) -> list[dict]:
+    base = f"https://{domain}/resource/{dataset_id}.json"
     headers = {}
 
     token = os.environ.get("LA_SOCRATA_APP_TOKEN")
@@ -96,46 +108,33 @@ def socrata_get(dataset_id: str, where: str | None, select: str | None, order: s
     params = {"$limit": limit, "$offset": offset}
     if where:
         params["$where"] = where
-    if select:
-        params["$select"] = select
     if order:
         params["$order"] = order
 
     r = requests.get(base, params=params, headers=headers, timeout=60)
-    r.raise_for_status()
+    # Helpful debugging if Socrata rejects query
+    if r.status_code >= 400:
+        raise RuntimeError(f"Socrata error {r.status_code}: {r.text[:500]} | URL={r.url}")
     return r.json()
 
 
 # -----------------------------
-# CSLB enrichment (authoritative)
-# Approach: scrape CSLB contractor detail by license # (<= 10/day safe)
-# CSLB detail pages work as /<license_number> (e.g., https://www.cslb.ca.gov/1)
+# CSLB enrichment (authoritative) via license detail page
 # -----------------------------
 def extract_license_number(text: str) -> str:
-    """
-    Attempt to extract a CA contractor license number from a messy contractor field.
-    We prefer 6–8 digit sequences and return the first plausible match.
-    """
     t = normalize_str(text)
     if not t:
         return ""
 
-    # Common patterns: "license # 1234567", "Lic#123456", "CSLB 1234567", etc.
     m = re.search(r"(?:licen[cs]e|cslb|lic|lic#)\s*[:#]?\s*([0-9]{6,8})", t, flags=re.IGNORECASE)
     if m:
         return m.group(1)
 
-    # Fallback: any 6-8 digit number in text
     m2 = re.search(r"\b([0-9]{6,8})\b", t)
     return m2.group(1) if m2 else ""
 
 
 def cslb_fetch_by_license(license_number: str, timeout: int = 30) -> dict:
-    """
-    Fetch CSLB contractor detail page and parse key fields from HTML.
-    Returns dict with:
-      business_name, address, phone, status, classifications (list[str])
-    """
     if not license_number:
         return {}
 
@@ -146,54 +145,25 @@ def cslb_fetch_by_license(license_number: str, timeout: int = 30) -> dict:
 
     html = r.text
 
-    # Very lightweight parsing using regex (stable enough for key fields).
-    # Business name often appears in title/header area:
-    business_name = ""
-    m = re.search(r"Contractor's License Detail for License #\s*" + re.escape(license_number) + r".*?</h1>", html, flags=re.IGNORECASE | re.DOTALL)
-    # Not always helpful; fallback to finding "Business Name" label blocks:
+    def rx(label: str) -> str:
+        m = re.search(rf"{label}\s*</[^>]+>\s*<[^>]+>\s*([^<]+)", html, flags=re.IGNORECASE)
+        return normalize_str(m.group(1)) if m else ""
+
+    business_name = rx("Business Name")
+    status = rx("License Status")
+    phone = rx("Business Phone")
+    address = rx("Business Address")
+
+    classifications = []
+    m = re.search(r"Classification\s*\(s\)\s*</[^>]+>\s*<[^>]+>\s*([^<]+)", html, flags=re.IGNORECASE)
+    if m:
+        raw = normalize_str(m.group(1))
+        classifications = [c.strip() for c in re.split(r"[;,]", raw) if c.strip()]
+
     if not business_name:
-        m2 = re.search(r"Business Name\s*</[^>]+>\s*<[^>]+>\s*([^<]+)", html, flags=re.IGNORECASE)
+        m2 = re.search(r"<h2[^>]*>\s*([^<]+)\s*</h2>", html, flags=re.IGNORECASE)
         if m2:
             business_name = normalize_str(m2.group(1))
-
-    # Status:
-    status = ""
-    m3 = re.search(r"License Status\s*</[^>]+>\s*<[^>]+>\s*([^<]+)", html, flags=re.IGNORECASE)
-    if m3:
-        status = normalize_str(m3.group(1))
-
-    # Phone:
-    phone = ""
-    m4 = re.search(r"Business Phone\s*</[^>]+>\s*<[^>]+>\s*([^<]+)", html, flags=re.IGNORECASE)
-    if m4:
-        phone = normalize_str(m4.group(1))
-
-    # Address (best-effort)
-    address = ""
-    m5 = re.search(r"Business Address\s*</[^>]+>\s*<[^>]+>\s*([^<]+)", html, flags=re.IGNORECASE)
-    if m5:
-        address = normalize_str(m5.group(1))
-
-    # Classifications (can be multiple)
-    classifications = []
-    # This label varies; try a few patterns
-    for pat in [
-        r"Classification\s*\(s\)\s*</[^>]+>\s*<[^>]+>\s*([^<]+)",
-        r"Classifications\s*</[^>]+>\s*<[^>]+>\s*([^<]+)",
-    ]:
-        m6 = re.search(pat, html, flags=re.IGNORECASE)
-        if m6:
-            raw = normalize_str(m6.group(1))
-            # Split on commas/semicolons
-            classifications = [c.strip() for c in re.split(r"[;,]", raw) if c.strip()]
-            break
-
-    # If we couldn't parse business name via label, try a conservative fallback:
-    if not business_name:
-        # sometimes appears as <h2>BUSINESS NAME</h2>
-        m7 = re.search(r"<h2[^>]*>\s*([^<]+)\s*</h2>", html, flags=re.IGNORECASE)
-        if m7:
-            business_name = normalize_str(m7.group(1))
 
     return {
         "license_number": license_number,
@@ -208,24 +178,13 @@ def cslb_fetch_by_license(license_number: str, timeout: int = 30) -> dict:
 
 # -----------------------------
 # NAICS mapping (commercial-first)
-# We keep it conservative. If unknown -> 236220.
 # -----------------------------
 ALLOWED_NAICS = {"238210", "236220", "237310", "238220", "238120"}
 
 
 def infer_naics_from_cslb(classifications: list[str]) -> str:
-    """
-    Best-effort mapping from CSLB class codes/names to NAICS.
-    - Electrical -> 238210
-    - Plumbing/HVAC -> 238220
-    - Structural steel -> 238120
-    - Heavy civil (rare in LADBS permits) -> 237310
-    - Default -> 236220 (Commercial/Institutional)
-    """
     text = " ".join(classifications or []).lower()
 
-    # Common CSLB class codes:
-    # C-10 Electrical, C-36 Plumbing, C-20 HVAC
     if "c-10" in text or "elect" in text:
         return "238210"
     if "c-36" in text or "plumb" in text or "c-20" in text or "hvac" in text or "air conditioning" in text or "heating" in text:
@@ -248,14 +207,9 @@ def naics_description(naics: str) -> str:
 
 
 # -----------------------------
-# 2026 start-date logic (based on 2025 issue_date)
-# Jan-Jun 2025 -> Q2 2026
-# Jul-Sep 2025 -> Q3 2026
-# Oct-Dec 2025 -> Q4 2026
+# 2026 start-date logic (based on 2025 issue date)
 # -----------------------------
 def start_date_from_issue_date(issue_date: str) -> str:
-    if not issue_date:
-        return ""
     y = year_of_iso(issue_date)
     m = month_of_iso(issue_date)
     if y != 2025 or m is None:
@@ -268,15 +222,9 @@ def start_date_from_issue_date(issue_date: str) -> str:
 
 
 # -----------------------------
-# DuckDuckGo enrichment (website only, lightweight)
+# DuckDuckGo website enrichment (optional)
 # -----------------------------
 def ddg_find_website(query: str, timeout: int = 30) -> str:
-    """
-    Very lightweight DDG HTML scrape:
-      - query DDG HTML endpoint
-      - return first plausible website domain (excluding social/search)
-    Safe because we rate-limit to <= 10/day.
-    """
     q = normalize_str(query)
     if not q:
         return ""
@@ -287,8 +235,6 @@ def ddg_find_website(query: str, timeout: int = 30) -> str:
         return ""
 
     html = r.text
-
-    # Extract result URLs
     links = re.findall(r'href="(https?://[^"]+)"', html, flags=re.IGNORECASE)
     if not links:
         return ""
@@ -302,7 +248,6 @@ def ddg_find_website(query: str, timeout: int = 30) -> str:
         "instagram.com",
         "linkedin.com",
         "yelp.com",
-        "mapquest.com",
         "yellowpages.com",
         "bbb.org",
         "opencorporates.com",
@@ -317,17 +262,14 @@ def ddg_find_website(query: str, timeout: int = 30) -> str:
         u = clean(u)
         if any(b in u.lower() for b in blocklist):
             continue
-        # Prefer root domain
         m = re.match(r"^(https?://[^/]+)", u)
-        if m:
-            return m.group(1)
-        return u
+        return m.group(1) if m else u
 
     return ""
 
 
 # -----------------------------
-# Row scoring (simple, explainable)
+# Confidence scoring
 # -----------------------------
 def confidence_score(valuation: float, has_license: bool, cslb_active: bool) -> tuple[int, str]:
     score = 0
@@ -353,16 +295,13 @@ def confidence_score(valuation: float, has_license: bool, cslb_active: bool) -> 
         score += 5
         why.append("valuation>=50k(+5)")
 
-    # Cap
-    score = min(score, 100)
-    return score, "; ".join(why) if why else "no_signals"
+    return min(score, 100), "; ".join(why) if why else "no_signals"
 
 
 # -----------------------------
 # Main
 # -----------------------------
 def main():
-    # Required env
     sheet_id = os.environ.get("LA_SHEET_ID")
     tab_name = os.environ.get("LA_TAB_NAME")
     if not sheet_id or not tab_name:
@@ -370,11 +309,10 @@ def main():
 
     max_new = int(os.environ.get("LA_MAX_NEW", "10"))
     sleep_seconds = float(os.environ.get("LA_SLEEP_SECONDS", "1.0"))
-
-    issue_year = int(os.environ.get("LA_ISSUE_YEAR", "2025"))
     min_valuation = float(os.environ.get("LA_MIN_VALUATION", "50000"))
+    issue_year = int(os.environ.get("LA_ISSUE_YEAR", "2025"))
 
-    # Connect sheet
+    # Connect to sheet
     gc = get_gspread_client()
     sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(tab_name)
@@ -384,36 +322,28 @@ def main():
     now = utc_now_str()
     rows_to_append = []
 
-    # SoQL filter: issued in the chosen year + valuation threshold
-    # Note: issue_date is a date/time field in this dataset.
-    where = (
-        f"issue_date >= '{issue_year}-01-01T00:00:00.000' AND "
-        f"issue_date < '{issue_year+1}-01-01T00:00:00.000' AND "
-        f"valuation IS NOT NULL AND "
-        f"valuation >= {min_valuation}"
-    )
+    # IMPORTANT: hbkd-qubn has different schema than pi9x-tg5x.
+    # We keep where/order flexible and schema-safe.
 
-    # Pull only the fields we need (reduces payload)
-    select = ",".join([
-        "permit_nbr",
-        "primary_address",
-        "zip_code",
-        "issue_date",
-        "status_desc",
-        "status_date",
-        "valuation",
-        "work_desc",
-        "permit_type",
-        "permit_sub_type",
-        "permit_group",
-        "use_desc",
-        "construction",
+    issue_date_fields = ["issue_date", "issued_date", "permit_issue_date", "date_issued", "issue_dt"]
+    valuation_fields = ["valuation", "permit_valuation", "estimated_cost", "est_cost", "valuation_amount"]
+    permit_id_fields = ["pcis_permit", "pcis_permit_number", "pcis_permit_", "permit_nbr", "permit_number", "permit_id"]
+    contractor_name_fields = [
+        "contractor_s_business_name",
+        "contractor_business_name",
+        "contractor_name",
         "contractor",
-        ":updated_at",
-    ])
+        "contractors_business_name",
+    ]
+    contractor_license_fields = ["license", "license_number", "license_no", "license_nbr", "contractor_license", "license_"]
+    address_fields = ["full_address", "address", "primary_address", "address_1", "site_address"]
+    zip_fields = ["zip_code", "zip", "zipcode"]
+    work_desc_fields = ["work_desc", "description", "permit_description", "work_description"]
 
-    # Most recent first (good for incremental runs)
-    order = "issue_date DESC"
+    # SoQL: try to filter by issue date if field exists (we will do it in Python anyway).
+    # We'll keep the WHERE minimal to avoid 400s.
+    where = None
+    order = None
 
     appended = 0
     offset = 0
@@ -421,52 +351,56 @@ def main():
 
     while appended < max_new:
         permits = socrata_get(
+            domain="data.lacity.org",
             dataset_id=LADBS_DATASET_ID,
             where=where,
-            select=select,
             order=order,
             limit=page_size,
             offset=offset,
         )
         if not permits:
             break
-
         offset += page_size
 
         for p in permits:
             if appended >= max_new:
                 break
 
-            permit_nbr = first_present(p, ["permit_nbr"])
-            if not permit_nbr:
+            permit_id = first_present(p, permit_id_fields)
+            if not permit_id:
+                continue
+            if permit_id in existing_ids:
                 continue
 
-            # Dedupe
-            if permit_nbr in existing_ids:
+            issue_date = first_present(p, issue_date_fields)
+            if year_of_iso(issue_date) != issue_year:
                 continue
 
-            issue_date = first_present(p, ["issue_date"])
             start_date = start_date_from_issue_date(issue_date)
             if not start_date:
                 continue  # strict: only mapped 2026 targets
 
-            contractor_raw = first_present(p, ["contractor"])
-            license_number = extract_license_number(contractor_raw)
+            valuation_raw = first_present(p, valuation_fields)
+            valuation = to_float(valuation_raw)
+            if valuation < min_valuation:
+                continue
 
-            # CSLB join (only if we found a license number)
-            cslb = {}
-            if license_number:
-                cslb = cslb_fetch_by_license(license_number)
-                time.sleep(0.5)  # be polite to CSLB
+            contractor_name = first_present(p, contractor_name_fields)
+            contractor_license = first_present(p, contractor_license_fields)
+            license_number = extract_license_number(contractor_license) or extract_license_number(contractor_name)
 
-            business_name = normalize_str(cslb.get("business_name")) or normalize_str(contractor_raw)
+            # Enforce: require license number for CSLB join quality
+            if not license_number:
+                continue
+
+            cslb = cslb_fetch_by_license(license_number)
+            time.sleep(0.5)
+
+            business_name = normalize_str(cslb.get("business_name")) or contractor_name
             cslb_status = normalize_str(cslb.get("status"))
             cslb_active = "active" in cslb_status.lower() if cslb_status else False
 
-            # Enforce your rule: Active-only CSLB (but only when we have CSLB data)
-            # If no license number was found, we skip (commercial-first + quality control).
-            if not license_number:
-                continue
+            # Enforce your rule: Active-only CSLB
             if not cslb_active:
                 continue
 
@@ -475,47 +409,28 @@ def main():
             if naics not in ALLOWED_NAICS:
                 continue
 
-            # Valuation
-            valuation_raw = first_present(p, ["valuation"])
-            try:
-                valuation = float(str(valuation_raw).replace(",", "").replace("$", ""))
-            except Exception:
-                valuation = 0.0
-
-            # Optional website enrichment (DDG) - lightweight and rate-limited by max_new
+            # Website via DDG (safe due to LA_MAX_NEW=10)
             website = ddg_find_website(f"{business_name} Los Angeles contractor") if business_name else ""
             time.sleep(0.25)
 
-            # Place of performance
-            address = first_present(p, ["primary_address"])
-            zip_code = first_present(p, ["zip_code"])
+            address = first_present(p, address_fields)
+            zip_code = first_present(p, zip_fields)
             pop = f"{address} {zip_code}".strip()
 
-            # Description (permit work)
-            work_desc = first_present(p, ["work_desc"])
-            use_desc = first_present(p, ["use_desc"])
-            permit_type = first_present(p, ["permit_type"])
-            permit_sub_type = first_present(p, ["permit_sub_type"])
-            permit_group = first_present(p, ["permit_group"])
+            work_desc = first_present(p, work_desc_fields)
 
-            desc_parts = [x for x in [permit_group, permit_type, permit_sub_type, use_desc, work_desc] if x]
-            description = " | ".join(desc_parts)
-
-            # Links
             award_link = (
                 f"https://data.lacity.org/resource/{LADBS_DATASET_ID}.json?"
-                f"$where=permit_nbr='{permit_nbr}'"
+                f"$where=pcis_permit='{permit_id}'"
             )
             cslb_profile = normalize_str(cslb.get("profile_url"))
             web_search = f"https://www.google.com/search?q={requests.utils.quote(business_name)}+Los+Angeles"
 
-            # Confidence
-            score, rationale = confidence_score(valuation, has_license=bool(license_number), cslb_active=cslb_active)
-
-            recipient_id = hashlib.md5(permit_nbr.encode("utf-8")).hexdigest()
+            score, rationale = confidence_score(valuation, has_license=True, cslb_active=True)
+            recipient_id = hashlib.md5(permit_id.encode("utf-8")).hexdigest()
 
             values = {
-                "Award ID": permit_nbr,
+                "Award ID": permit_id,
                 "Recipient (Company)": business_name,
                 "Recipient UEI": "",
                 "Parent Recipient UEI": "",
@@ -529,7 +444,7 @@ def main():
                 "NAICS Description": naics_description(naics),
                 "Awarding Agency": "Los Angeles Department of Building and Safety",
                 "Place of Performance": pop,
-                "Description": description,
+                "Description": work_desc,
                 "Award Link": award_link,
                 "Recipient Profile Link": cslb_profile,
                 "Web Search Link": web_search,
@@ -550,25 +465,26 @@ def main():
                 "notes": f"CSLB license {license_number}; status={cslb_status}".strip(),
             }
 
-            # Build ordered row in header order
             ordered_row = [""] * len(hmap)
             for header, col_index in hmap.items():
                 ordered_row[col_index - 1] = values.get(header, "")
 
             rows_to_append.append(ordered_row)
-            existing_ids.add(permit_nbr)
+            existing_ids.add(permit_id)
             appended += 1
 
             time.sleep(sleep_seconds)
 
-        # Gentle pacing between pages
         time.sleep(0.5)
 
     if rows_to_append:
         ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
         print(f"✅ Appended {len(rows_to_append)} rows into {tab_name}.")
     else:
-        print("No rows appended (filters may be too strict or no CSLB license numbers found).")
+        print("No rows appended. Most likely causes:")
+        print("- hbkd-qubn rows don’t include license # for recent permits")
+        print("- issue_date field naming differs and filtering skipped everything")
+        print("- CSLB status not Active for extracted licenses")
 
     print("Done.")
 
