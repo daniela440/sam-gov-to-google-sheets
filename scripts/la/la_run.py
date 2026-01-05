@@ -3,6 +3,7 @@ import json
 import time
 import hashlib
 import re
+import io
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional
 
@@ -11,31 +12,22 @@ import gspread
 from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 
+import openpyxl  # for .xlsx
+import xlrd      # for .xls (BIFF)
+
 
 # =============================
 # CONFIG
 # =============================
 
-# CSLB Public Data Portal – List by Classification and County
 CSLB_LIST_BY_COUNTY_URL = "https://www.cslb.ca.gov/onlineservices/dataportal/ListByCounty.aspx"
 
-# Your allowed NAICS (fixed scope)
 ALLOWED_NAICS = {"238210", "236220", "237310", "238220", "238120"}
-
-# We must stay within CSLB portal limits: up to 10 classifications + up to 10 counties.
-# LA County only:
 TARGET_COUNTY = "Los Angeles"
 
-# Classification selection (<=10):
-# - 236220: B (General Building) (+ A sometimes overlaps but we keep A for 237310 signal)
-# - 238210: C-10
-# - 238220: C-20 (HVAC), C-36 (Plumbing), C-4 (Boiler/Steam)
-# - 237310: A (General Engineering), C-32 (Parking/Highway)
-# - 238120: C-51 (Structural Steel), C-50 (Reinforcing Steel)
-TARGET_CLASSIFICATIONS = ["A", "B", "C-10", "C-20", "C-36", "C-4", "C-32", "C-51", "C-50"]  # 9 items
+# <=10 classifications
+TARGET_CLASSIFICATIONS = ["A", "B", "C-10", "C-20", "C-36", "C-4", "C-32", "C-51", "C-50"]
 
-
-# CSLB classification -> NAICS mapping (conservative)
 CLASS_TO_NAICS = {
     "C-10": "238210",
     "C-20": "238220",
@@ -100,10 +92,6 @@ def get_gspread_client():
 
 
 def ddg_find_website(query: str, timeout: int = 30) -> str:
-    """
-    Light-touch DuckDuckGo HTML search.
-    Returns a best-effort domain URL. Keep capped per run.
-    """
     q = normalize_str(query)
     if not q:
         return ""
@@ -150,7 +138,7 @@ def ddg_find_website(query: str, timeout: int = 30) -> str:
 
 
 # =============================
-# CSLB portal download (ASP.NET form)
+# CSLB portal download (ASP.NET)
 # =============================
 
 def _extract_aspnet_form_fields(soup: BeautifulSoup) -> Dict[str, str]:
@@ -159,138 +147,171 @@ def _extract_aspnet_form_fields(soup: BeautifulSoup) -> Dict[str, str]:
         name = inp.get("name")
         if not name:
             continue
-        # include hidden + regular inputs
         fields[name] = inp.get("value", "")
     return fields
 
 
-def _find_multi_select_names(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str]]:
-    """
-    CSLB ListByCounty has two multi-selects:
-      - classifications
-      - counties
-    We detect them heuristically: first two <select multiple>.
-    """
+def _find_select_name_by_contains(soup: BeautifulSoup, must_contain: str) -> Optional[str]:
+    for sel in soup.find_all("select"):
+        name = normalize_str(sel.get("name"))
+        if must_contain.lower() in name.lower():
+            return name
+    return None
+
+
+def _guess_class_and_county_select_names(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str]]:
+    # Try to find names that contain "class" and "county"
+    class_name = _find_select_name_by_contains(soup, "class")
+    county_name = _find_select_name_by_contains(soup, "county")
+
+    if class_name and county_name:
+        return class_name, county_name
+
+    # Fallback to first two selects if heuristic fails
     selects = soup.find_all("select")
-    multi = [s for s in selects if s.has_attr("multiple")]
-    if len(multi) >= 2:
-        return multi[0].get("name"), multi[1].get("name")
-    # fallback: if they don't use "multiple", still try 2 selects on page
     if len(selects) >= 2:
         return selects[0].get("name"), selects[1].get("name")
+
     return None, None
 
 
-def _find_submit_button_name(soup: BeautifulSoup) -> Optional[str]:
-    """
-    CSLB uses an ASP.NET button; name may vary.
-    We pick the first submit-ish input/button.
-    """
-    # input type=submit
-    for inp in soup.select("input"):
-        if normalize_str(inp.get("type")).lower() in {"submit", "image"}:
-            return inp.get("name")
-    # <button>
-    btn = soup.find("button")
-    return btn.get("name") if btn else None
+def _find_button_name_by_value(soup: BeautifulSoup, value_contains: str) -> Optional[str]:
+    for inp in soup.find_all("input"):
+        if normalize_str(inp.get("type")).lower() == "submit":
+            val = normalize_str(inp.get("value"))
+            if value_contains.lower() in val.lower():
+                return inp.get("name")
+    return None
 
 
-def download_cslb_list_by_county_xls(
-    session: requests.Session,
-    classifications: List[str],
-    counties: List[str],
-    timeout: int = 60
-) -> bytes:
-    """
-    Downloads the "Excel (.xls)" output from CSLB ListByCounty.
-    Returns raw bytes.
-    """
-
-    # 1) GET page to obtain VIEWSTATE, etc.
+def download_cslb_list_by_county(session: requests.Session, classifications: List[str], counties: List[str], timeout: int = 60) -> bytes:
     r0 = session.get(CSLB_LIST_BY_COUNTY_URL, timeout=timeout)
     r0.raise_for_status()
     soup0 = BeautifulSoup(r0.text, "lxml")
 
     form_fields = _extract_aspnet_form_fields(soup0)
-    class_select_name, county_select_name = _find_multi_select_names(soup0)
-    submit_name = _find_submit_button_name(soup0)
+    class_select_name, county_select_name = _guess_class_and_county_select_names(soup0)
 
     if not class_select_name or not county_select_name:
-        raise RuntimeError(
-            "Could not locate classification/county select fields on CSLB page. "
-            "CSLB page structure may have changed."
-        )
+        raise RuntimeError("Could not locate classification/county select fields on CSLB page (page structure changed).")
 
-    # 2) Prepare POST payload
-    payload = dict(form_fields)
+    # The CSLB page often has a dedicated download button. We try to find a submit button with "Excel" in it.
+    download_btn_name = _find_button_name_by_value(soup0, "excel")
 
-    # Multi-select values in ASP.NET are submitted as repeated keys.
-    # requests supports this by using a list of tuples.
-    post_items = list(payload.items())
-
+    # Build POST list (multi-select = repeated keys)
+    post_items = list(form_fields.items())
     for c in classifications:
         post_items.append((class_select_name, c))
     for cty in counties:
         post_items.append((county_select_name, cty))
 
-    # Some ASP.NET forms require the submit button name to be present
-    if submit_name:
-        post_items.append((submit_name, "Download"))
+    # If we found an Excel button, include it; otherwise, submit generic
+    if download_btn_name:
+        post_items.append((download_btn_name, "Excel"))
+    else:
+        # generic fallback: trigger postback
+        post_items.append(("__EVENTTARGET", ""))
+        post_items.append(("__EVENTARGUMENT", ""))
 
-    # 3) POST
     r1 = session.post(CSLB_LIST_BY_COUNTY_URL, data=post_items, timeout=timeout)
     r1.raise_for_status()
-
     return r1.content
 
 
-def parse_cslb_xls_html_table(xls_bytes: bytes) -> List[Dict[str, str]]:
-    """
-    CSLB 'xls' is commonly an HTML table.
-    We parse table headers + rows to dictionaries.
-    """
-    text = None
-    try:
-        text = xls_bytes.decode("utf-8", errors="ignore")
-    except Exception:
-        text = ""
+# =============================
+# Parsers for CSLB download
+# =============================
 
-    if "<table" not in text.lower():
-        # If CSLB ever switches to true binary XLS, we fail fast with a clear message.
-        raise RuntimeError(
-            "CSLB download did not look like an HTML-table XLS. "
-            "If CSLB switched to a true .xls binary, we need a different parser."
-        )
+def _looks_like_xlsx(b: bytes) -> bool:
+    return len(b) >= 2 and b[0:2] == b"PK"  # zip
 
+
+def _looks_like_xls(b: bytes) -> bool:
+    # OLE header: D0 CF 11 E0 A1 B1 1A E1
+    return len(b) >= 8 and b[0:8] == bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])
+
+
+def _looks_like_html(b: bytes) -> bool:
+    t = b[:2000].lower()
+    return b"<html" in t or b"<!doctype html" in t or b"<table" in t
+
+
+def parse_excel_xlsx(x: bytes) -> List[Dict[str, str]]:
+    wb = openpyxl.load_workbook(io.BytesIO(x), read_only=True, data_only=True)
+    ws = wb.worksheets[0]
+    rows_iter = ws.iter_rows(values_only=True)
+
+    headers = []
+    out = []
+    for idx, row in enumerate(rows_iter):
+        values = [normalize_str(v) for v in row]
+        if idx == 0:
+            headers = values
+            continue
+        if not any(values):
+            continue
+        # pad/truncate
+        if len(values) < len(headers):
+            values += [""] * (len(headers) - len(values))
+        out.append({headers[i]: values[i] for i in range(min(len(headers), len(values)))})
+    return out
+
+
+def parse_excel_xls(x: bytes) -> List[Dict[str, str]]:
+    book = xlrd.open_workbook(file_contents=x)
+    sheet = book.sheet_by_index(0)
+
+    if sheet.nrows < 1:
+        return []
+
+    headers = [normalize_str(sheet.cell_value(0, c)) for c in range(sheet.ncols)]
+    out = []
+    for r in range(1, sheet.nrows):
+        rowvals = [normalize_str(sheet.cell_value(r, c)) for c in range(sheet.ncols)]
+        if not any(rowvals):
+            continue
+        if len(rowvals) < len(headers):
+            rowvals += [""] * (len(headers) - len(rowvals))
+        out.append({headers[i]: rowvals[i] for i in range(min(len(headers), len(rowvals)))})
+    return out
+
+
+def parse_html_table(x: bytes) -> List[Dict[str, str]]:
+    text = x.decode("utf-8", errors="ignore")
     soup = BeautifulSoup(text, "lxml")
     table = soup.find("table")
     if not table:
+        # show a short snippet to help debugging if CSLB returned an error page
+        snippet = re.sub(r"\s+", " ", text[:400])
+        raise RuntimeError(f"CSLB response was HTML but contained no table. Snippet: {snippet}")
+
+    first_row = table.find("tr")
+    if not first_row:
         return []
 
-    # header
-    headers = []
-    thead = table.find("thead")
-    if thead:
-        headers = [normalize_str(th.get_text(" ", strip=True)) for th in thead.find_all(["th", "td"])]
-    if not headers:
-        first_row = table.find("tr")
-        if first_row:
-            headers = [normalize_str(cell.get_text(" ", strip=True)) for cell in first_row.find_all(["th", "td"])]
-
-    # rows
-    results = []
-    rows = table.find_all("tr")
-    for tr in rows[1:]:  # skip header row
+    headers = [normalize_str(cell.get_text(" ", strip=True)) for cell in first_row.find_all(["th", "td"])]
+    out = []
+    for tr in table.find_all("tr")[1:]:
         cells = [normalize_str(td.get_text(" ", strip=True)) for td in tr.find_all(["td", "th"])]
         if not cells or all(not c for c in cells):
             continue
-        # pad / truncate to headers
         if len(cells) < len(headers):
             cells += [""] * (len(headers) - len(cells))
-        row = {headers[i]: cells[i] for i in range(min(len(headers), len(cells)))}
-        results.append(row)
+        out.append({headers[i]: cells[i] for i in range(min(len(headers), len(cells)))})
+    return out
 
-    return results
+
+def parse_cslb_download(data: bytes) -> List[Dict[str, str]]:
+    if _looks_like_xlsx(data):
+        return parse_excel_xlsx(data)
+    if _looks_like_xls(data):
+        return parse_excel_xls(data)
+    if _looks_like_html(data):
+        return parse_html_table(data)
+
+    # Unknown
+    sniff = data[:40]
+    raise RuntimeError(f"Unknown CSLB download format. First 40 bytes: {sniff!r}")
 
 
 # =============================
@@ -298,36 +319,27 @@ def parse_cslb_xls_html_table(xls_bytes: bytes) -> List[Dict[str, str]]:
 # =============================
 
 def infer_naics_from_classifications(classifications_str: str) -> str:
-    """
-    CSLB file often provides 'Classification(s)' as a comma-separated string.
-    We map to your allowed NAICS using CLASS_TO_NAICS.
-    If multiple are present, we pick the first match in priority order.
-    """
     raw = normalize_str(classifications_str)
     if not raw:
         return ""
 
-    # Normalize tokens like "C10" -> "C-10" if needed
     tokens = []
     for part in re.split(r"[;,/|]\s*|\s{2,}", raw):
         p = normalize_str(part).upper()
         if not p:
             continue
-        # Fix "C10" => "C-10"
         m = re.match(r"^(C)\s*-?\s*(\d+)$", p)
         if m:
             p = f"C-{m.group(2)}"
         tokens.append(p)
 
-    # Priority: keep your trade NAICS first, then B
-    priority_classes = ["C-10", "C-36", "C-20", "C-4", "C-51", "C-50", "C-32", "A", "B"]
+    priority = ["C-10", "C-36", "C-20", "C-4", "C-51", "C-50", "C-32", "A", "B"]
     token_set = set(tokens)
 
-    for c in priority_classes:
+    for c in priority:
         if c in token_set and c in CLASS_TO_NAICS:
             return CLASS_TO_NAICS[c]
 
-    # Fallback: any mapped token
     for t in tokens:
         if t in CLASS_TO_NAICS:
             return CLASS_TO_NAICS[t]
@@ -336,15 +348,11 @@ def infer_naics_from_classifications(classifications_str: str) -> str:
 
 
 def confidence_for_row(status: str, phone: str) -> Tuple[int, str, str]:
-    """
-    Simple, transparent confidence scoring.
-    CSLB list is already curated; main differentiator is 'Active' + phone present.
-    """
     s = normalize_str(status).lower()
     p = normalize_str(phone)
 
     score = 70
-    rationale = ["cslb_list_by_county(+70)"]
+    rationale = ["cslb_county_list(+70)"]
 
     if "active" in s:
         score += 15
@@ -367,13 +375,11 @@ def main():
     if not sheet_id or not tab_name:
         raise RuntimeError("Missing LA_SHEET_ID or LA_TAB_NAME")
 
-    # Output control
-    max_new = int(os.environ.get("LA_MAX_NEW", "200"))  # total append cap per run
+    max_new = int(os.environ.get("LA_MAX_NEW", "200"))
     sleep_seconds = float(os.environ.get("LA_SLEEP_SECONDS", "0.2"))
 
-    # DDG enrichment (optional, capped)
     enable_ddg = os.environ.get("LA_ENABLE_DDG", "true").lower() == "true"
-    ddg_cap = int(os.environ.get("LA_DDG_DAILY_CAP", "10"))  # you requested 10/day safety
+    ddg_cap = int(os.environ.get("LA_DDG_DAILY_CAP", "10"))
 
     # Connect sheet
     gc = get_gspread_client()
@@ -382,34 +388,26 @@ def main():
     hmap = header_map(ws)
     existing_ids = load_existing_award_ids(ws)
 
-    # 1) Download CSLB list for LA County + target classifications
     sess = requests.Session()
     sess.headers.update({"User-Agent": "Mozilla/5.0"})
 
     print(f"Downloading CSLB list for county={TARGET_COUNTY} classifications={TARGET_CLASSIFICATIONS} ...")
-    xls_bytes = download_cslb_list_by_county_xls(
+    payload_bytes = download_cslb_list_by_county(
         session=sess,
         classifications=TARGET_CLASSIFICATIONS,
         counties=[TARGET_COUNTY],
     )
 
-    # 2) Parse
-    rows = parse_cslb_xls_html_table(xls_bytes)
+    rows = parse_cslb_download(payload_bytes)
     print(f"Parsed {len(rows)} CSLB rows from download.")
 
-    # 3) Append into sheet (dedupe by License Number)
     now = utc_now_str()
     rows_to_append = []
     ddg_used = 0
     appended = 0
 
-    # Try to resolve likely column names from CSLB output
-    # (Portal content can change, so we use multi-candidate extraction.)
+    # Helper to get column case-insensitively
     def col(row: dict, candidates: List[str]) -> str:
-        for c in candidates:
-            if c in row and normalize_str(row[c]):
-                return normalize_str(row[c])
-        # case-insensitive match
         lower_map = {k.lower(): k for k in row.keys()}
         for c in candidates:
             k = lower_map.get(c.lower())
@@ -425,7 +423,7 @@ def main():
         if not license_no:
             continue
 
-        award_id = license_no  # Award ID = CSLB license number (stable, dedupe-friendly)
+        award_id = license_no
         if award_id in existing_ids:
             continue
 
@@ -442,11 +440,9 @@ def main():
         if not naics or naics not in ALLOWED_NAICS:
             continue
 
-        # Strict-ish: keep Active only (recommended for outreach)
         if "active" not in normalize_str(status).lower():
             continue
 
-        # Optional website enrichment (DDG), capped
         website = ""
         if enable_ddg and ddg_used < ddg_cap and business:
             website = ddg_find_website(f"{business} contractor Los Angeles CA")
@@ -455,15 +451,14 @@ def main():
 
         score, rationale, conf_level = confidence_for_row(status=status, phone=phone)
 
-        pop = safe_join([address, city, state, zip_code], sep=", ").replace(", ,", ",").strip(", ").strip()
+        hq_addr = safe_join([address, city, state, zip_code], sep=", ").replace(", ,", ",").strip(", ").strip()
         recipient_id = hashlib.md5(award_id.encode("utf-8")).hexdigest()
 
-        # We do not have permit-based start/end dates in this model.
-        # We anchor to a consistent 2026 target date to fit your downstream pipeline.
+        # For consistency with your downstream system, keep a 2026 start anchor.
+        # (No permit dates exist in this CSLB list feed.)
         start_date = "2026-07-01"
 
-        # Links
-        recipient_profile = f"https://www.cslb.ca.gov/OnlineServices/CheckLicenseII/CheckLicense.aspx"
+        recipient_profile = "https://www.cslb.ca.gov/OnlineServices/CheckLicenseII/CheckLicense.aspx"
         web_search = f"https://www.google.com/search?q={requests.utils.quote(business)}+CSLB+{award_id}"
 
         values = {
@@ -472,23 +467,23 @@ def main():
             "Recipient UEI": "",
             "Parent Recipient UEI": "",
             "Parent Recipient DUNS": "",
-            "Recipient (HQ) Address": pop,  # best available from CSLB export
+            "Recipient (HQ) Address": hq_addr,
             "Start Date": start_date,
             "End Date": "",
             "Last Modified Date": now,
-            "Award Amount (Obligated)": "",  # CSLB list does not include project value
+            "Award Amount (Obligated)": "",
             "NAICS Code": naics,
             "NAICS Description": NAICS_DESC.get(naics, ""),
             "Awarding Agency": "CSLB Public Data Portal (List by Classification & County)",
             "Place of Performance": "Los Angeles County, CA",
             "Description": f"CSLB licensed contractor in Los Angeles County. Classifications: {classifications}",
-            "Award Link": "",  # not applicable (no award record)
+            "Award Link": "",
             "Recipient Profile Link": recipient_profile,
             "Web Search Link": web_search,
 
             "Company Website": website,
             "Company Phone": phone,
-            "Company General Email": "",  # CSLB explicitly does not provide email
+            "Company General Email": "",
             "Responsible Person Name": "",
             "Responsible Person Role": "",
             "Responsible Person Email": "",
@@ -518,10 +513,7 @@ def main():
         ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
         print(f"✅ Appended {len(rows_to_append)} rows into {tab_name}.")
     else:
-        print("No rows appended. Possible causes:")
-        print("- CSLB portal output schema changed (field names differ)")
-        print("- LA county list returned no Active rows for selected classifications (unlikely)")
-        print("- Your sheet headers don’t match expected names (Award ID / Recipient (Company) etc.)")
+        print("No rows appended. If this happens, the CSLB output headers may differ from our column candidates.")
 
     print(f"DDG used: {ddg_used} (cap={ddg_cap})")
     print("Done.")
