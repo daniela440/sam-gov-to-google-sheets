@@ -224,34 +224,46 @@ def _find_submit_button_name(soup: BeautifulSoup) -> Optional[Tuple[str, str]]:
     return None
 
 
-def _find_excel_postback_target(html: str) -> Optional[Tuple[str, str]]:
+def _find_export_postback_target(html: str) -> Optional[Tuple[str, str]]:
     """
-    Try to locate a __doPostBack('TARGET','ARG') call associated with Excel export.
+    Find an ASP.NET postback target/arg for export/download.
+    Handles single quotes, double quotes, and HTML entity quotes.
     Returns (TARGET, ARG) if found.
     """
-    # First pass: look for doPostBack calls and pick ones whose arg or surrounding mentions Excel
-    candidates = re.findall(r"__doPostBack\('([^']+)'\s*,\s*'([^']*)'\)", html, flags=re.IGNORECASE)
+    if not html:
+        return None
+
+    candidates = []
+
+    patterns = [
+        r"__doPostBack\('([^']+)'\s*,\s*'([^']*)'\)",   # single quotes
+        r'__doPostBack\("([^"]+)"\s*,\s*"([^"]*)"\)',  # double quotes
+        r"__doPostBack\(&#39;([^&]+)&#39;\s*,\s*&#39;([^&]*)&?#39;\)",  # entity quotes (best-effort)
+    ]
+
+    for pat in patterns:
+        for target, arg in re.findall(pat, html, flags=re.IGNORECASE):
+            candidates.append((target, arg))
+
     if not candidates:
         return None
 
-    # If any arg explicitly contains "excel", take it
+    # Choose best candidate by heuristics:
+    # prefer those that look like download/export/xls/excel
     for target, arg in candidates:
-        if "excel" in (arg or "").lower():
+        blob = f"{target} {arg}".lower()
+        if any(k in blob for k in ["export", "download", "excel", "xls", "xlsx"]):
             return target, arg
 
-    # Otherwise look for the word excel near the call (rough heuristic)
-    for m in re.finditer(r"__doPostBack\('([^']+)'\s*,\s*'([^']*)'\)", html, flags=re.IGNORECASE):
-        window = html[max(0, m.start() - 120): m.end() + 120].lower()
-        if "excel" in window or ".xls" in window or "export" in window:
-            return m.group(1), m.group(2)
+    # fallback: if nothing matches keywords, just return the first
+    return candidates[0]
+
 
     return None
 def debug_dump_html(label: str, html: str) -> None:
     """
-    Debug helper to print page structure + ALWAYS show snippets near:
-    __doPostBack, download, export, excel (no early break).
-
-    Copy/paste this function over your existing debug_dump_html().
+    Debug helper to print page structure + show postback/export hints.
+    Copy/paste over your existing debug_dump_html().
     """
     try:
         soup = BeautifulSoup(html or "", "lxml")
@@ -265,17 +277,15 @@ def debug_dump_html(label: str, html: str) -> None:
 
         submits = []
         for inp in soup.find_all("input"):
-            if normalize_str(inp.get("type")).lower() == "submit":
-                submits.append((normalize_str(inp.get("name")), normalize_str(inp.get("value"))))
+            t = normalize_str(inp.get("type")).lower()
+            if t in ("submit", "image", "button"):
+                submits.append((t, normalize_str(inp.get("name")), normalize_str(inp.get("value")), normalize_str(inp.get("id"))))
 
         buttons = []
         for b in soup.find_all("button"):
-            buttons.append(
-                (
-                    normalize_str(b.get("name")),
-                    normalize_str(b.get("value")) or normalize_str(b.get_text(" ", strip=True)),
-                )
-            )
+            buttons.append((normalize_str(b.get("name")),
+                            normalize_str(b.get("value")) or normalize_str(b.get_text(" ", strip=True)),
+                            normalize_str(b.get("id"))))
 
         print("---- CSLB DEBUG ----")
         print(f"[{label}] title={title!r}")
@@ -292,39 +302,55 @@ def debug_dump_html(label: str, html: str) -> None:
                     names.append(nm)
             print(f"[{label}] select_names_sample={names}")
 
-        print(f"[{label}] submit_inputs={submits[:10]}")
-        print(f"[{label}] buttons={buttons[:10]}")
+        print(f"[{label}] inputs_sample={submits[:10]}")
+        print(f"[{label}] buttons_sample={buttons[:10]}")
 
         lowered = (html or "").lower()
-
-        # 1) Print whether __doPostBack exists at all (quick signal)
         print(f"[{label}] contains___doPostBack={('__dopostback' in lowered)}")
 
-        # 2) ALWAYS print snippets for these keywords if present (no early break)
-        for kw in ["__dopostback", "download", "export", "excel", ".xls", ".xlsx"]:
+        # Print snippets near key words (no break)
+        for kw in ["__dopostback", "download", "export", "excel", ".xls", ".xlsx", "listbycounty"]:
             idx = lowered.find(kw)
             if idx != -1:
-                start = max(0, idx - 200)
-                end = min(len(html), idx + 500)
+                start = max(0, idx - 250)
+                end = min(len(html), idx + 600)
                 snippet = re.sub(r"\s+", " ", html[start:end])
                 print(f"[{label}] snippet_near_{kw!r}: {snippet[:900]}")
 
-        # 3) Also print first few doPostBack calls found (very useful)
-        calls = re.findall(
-            r"__doPostBack\('([^']+)'\s*,\s*'([^']*)'\)",
-            html or "",
-            flags=re.IGNORECASE,
-        )
-        if calls:
-            print(f"[{label}] doPostBack_calls_found={len(calls)} sample={calls[:8]}")
-        else:
-            print(f"[{label}] doPostBack_calls_found=0")
+        # Robust postback extraction: single quotes, double quotes, and HTML entities
+        calls = []
+        patterns = [
+            r"__doPostBack\('([^']+)'\s*,\s*'([^']*)'\)",   # single quotes
+            r'__doPostBack\("([^"]+)"\s*,\s*"([^"]*)"\)',  # double quotes
+            r"__doPostBack\(&#39;([^&]+)&#39;\s*,\s*&#39;([^&]*)&?#39;\)",  # entity quotes (best-effort)
+        ]
+        for pat in patterns:
+            calls.extend(re.findall(pat, html or "", flags=re.IGNORECASE))
 
+        # De-dupe while preserving order
+        seen = set()
+        calls_unique = []
+        for t, a in calls:
+            key = (t, a)
+            if key not in seen:
+                seen.add(key)
+                calls_unique.append(key)
+
+        print(f"[{label}] doPostBack_calls_found={len(calls_unique)} sample={calls_unique[:12]}")
+
+        # Also scan for elements that mention doPostBack / download / xls in href/onclick
+        candidates = []
+        for tag in soup.find_all(True):
+            href = normalize_str(tag.get("href"))
+            onclick = normalize_str(tag.get("onclick"))
+            blob = f"{href} {onclick}".lower()
+            if any(k in blob for k in ["dopostback", "download", "export", ".xls", ".xlsx", "excel", "listbycounty"]):
+                candidates.append((tag.name, normalize_str(tag.get("id")), normalize_str(tag.get("name")), href[:160], onclick[:160]))
+
+        print(f"[{label}] href_onclick_candidates_found={len(candidates)} sample={candidates[:10]}")
         print("---- END CSLB DEBUG ----")
     except Exception as e:
         print(f"[{label}] debug_dump_html failed: {e}")
-
-
 
 
 def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tuple[Optional[bytes], Optional[bytes]]:
@@ -382,7 +408,7 @@ def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tu
         return None, None
 
     # Step 2: Try to trigger Excel export via postback (if present)
-    pb = _find_excel_postback_target(r1.text)
+    pb = _find_export_postback_target(r1.text)
     if pb:
         target, arg = pb
         soup1 = BeautifulSoup(r1.text, "lxml")
