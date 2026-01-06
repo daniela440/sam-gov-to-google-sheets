@@ -152,6 +152,38 @@ def is_maintenance_or_no_data_page(html: str) -> bool:
     ]
     return any(s in t for s in signals)
 
+from urllib.parse import urljoin
+
+def _find_direct_download_link(html: str) -> Optional[str]:
+    """
+    Returns an absolute URL if page contains a direct download link (.xls/.xlsx or export/download endpoint).
+    """
+    soup = BeautifulSoup(html or "", "lxml")
+    for a in soup.find_all("a"):
+        href = normalize_str(a.get("href"))
+        txt = normalize_str(a.get_text(" ", strip=True))
+        blob = f"{href} {txt}".lower()
+
+        if not href:
+            continue
+
+        # direct file link OR export/download-like endpoint
+        if any(k in blob for k in [".xls", ".xlsx", "download", "export", "excel"]):
+            # ignore javascript links
+            if href.lower().startswith("javascript:"):
+                continue
+            return urljoin(CSLB_LIST_BY_COUNTY_URL, href)
+
+    return None
+
+
+def _is_excel_response(resp: requests.Response) -> bool:
+    ct = (resp.headers.get("Content-Type") or "").lower()
+    cd = (resp.headers.get("Content-Disposition") or "").lower()
+    if "excel" in ct or ".xls" in cd or "attachment" in cd:
+        return True
+    return _looks_like_xls(resp.content) or _looks_like_xlsx(resp.content)
+
 
 # =============================
 # CSLB portal interaction (ASP.NET)
@@ -262,30 +294,23 @@ def _find_export_postback_target(html: str) -> Optional[Tuple[str, str]]:
     return None
 def debug_dump_html(label: str, html: str) -> None:
     """
-    Debug helper to print page structure + show postback/export hints.
     Copy/paste over your existing debug_dump_html().
+
+    Prints:
+      - form controls (submit/button/image)
+      - anchor candidates (href/text includes download/export/xls)
+      - doPostBack calls in single-quote + double-quote formats
     """
     try:
         soup = BeautifulSoup(html or "", "lxml")
         title = soup.title.get_text(" ", strip=True) if soup.title else ""
+
         tables = soup.find_all("table")
         selects = soup.find_all("select")
 
         max_tr = 0
         if tables:
             max_tr = max(len(t.find_all("tr")) for t in tables)
-
-        submits = []
-        for inp in soup.find_all("input"):
-            t = normalize_str(inp.get("type")).lower()
-            if t in ("submit", "image", "button"):
-                submits.append((t, normalize_str(inp.get("name")), normalize_str(inp.get("value")), normalize_str(inp.get("id"))))
-
-        buttons = []
-        for b in soup.find_all("button"):
-            buttons.append((normalize_str(b.get("name")),
-                            normalize_str(b.get("value")) or normalize_str(b.get_text(" ", strip=True)),
-                            normalize_str(b.get("id"))))
 
         print("---- CSLB DEBUG ----")
         print(f"[{label}] title={title!r}")
@@ -302,55 +327,50 @@ def debug_dump_html(label: str, html: str) -> None:
                     names.append(nm)
             print(f"[{label}] select_names_sample={names}")
 
-        print(f"[{label}] inputs_sample={submits[:10]}")
-        print(f"[{label}] buttons_sample={buttons[:10]}")
+        # Inputs that could trigger download
+        inputs = []
+        for inp in soup.find_all("input"):
+            t = normalize_str(inp.get("type")).lower()
+            if t in ("submit", "button", "image"):
+                inputs.append(
+                    (
+                        t,
+                        normalize_str(inp.get("id")),
+                        normalize_str(inp.get("name")),
+                        normalize_str(inp.get("value")),
+                    )
+                )
+        print(f"[{label}] action_inputs_found={len(inputs)} sample={inputs[:15]}")
 
-        lowered = (html or "").lower()
-        print(f"[{label}] contains___doPostBack={('__dopostback' in lowered)}")
+        # Anchors that look like download/export links
+        anchors = []
+        for a in soup.find_all("a"):
+            href = normalize_str(a.get("href"))
+            txt = normalize_str(a.get_text(" ", strip=True))
+            blob = f"{href} {txt}".lower()
+            if any(k in blob for k in ["download", "export", "excel", ".xls", ".xlsx", "listbycounty"]):
+                anchors.append((normalize_str(a.get("id")), normalize_str(a.get("name")), href[:200], txt[:120]))
+        print(f"[{label}] anchor_candidates_found={len(anchors)} sample={anchors[:15]}")
 
-        # Print snippets near key words (no break)
-        for kw in ["__dopostback", "download", "export", "excel", ".xls", ".xlsx", "listbycounty"]:
-            idx = lowered.find(kw)
-            if idx != -1:
-                start = max(0, idx - 250)
-                end = min(len(html), idx + 600)
-                snippet = re.sub(r"\s+", " ", html[start:end])
-                print(f"[{label}] snippet_near_{kw!r}: {snippet[:900]}")
-
-        # Robust postback extraction: single quotes, double quotes, and HTML entities
+        # Postback calls (single-quote AND double-quote)
         calls = []
-        patterns = [
-            r"__doPostBack\('([^']+)'\s*,\s*'([^']*)'\)",   # single quotes
-            r'__doPostBack\("([^"]+)"\s*,\s*"([^"]*)"\)',  # double quotes
-            r"__doPostBack\(&#39;([^&]+)&#39;\s*,\s*&#39;([^&]*)&?#39;\)",  # entity quotes (best-effort)
-        ]
-        for pat in patterns:
-            calls.extend(re.findall(pat, html or "", flags=re.IGNORECASE))
+        calls += re.findall(r"__doPostBack\('([^']+)'\s*,\s*'([^']*)'\)", html or "", flags=re.IGNORECASE)
+        calls += re.findall(r'__doPostBack\("([^"]+)"\s*,\s*"([^"]*)"\)', html or "", flags=re.IGNORECASE)
 
-        # De-dupe while preserving order
+        # De-dupe
         seen = set()
-        calls_unique = []
+        calls_u = []
         for t, a in calls:
             key = (t, a)
             if key not in seen:
                 seen.add(key)
-                calls_unique.append(key)
+                calls_u.append(key)
+        print(f"[{label}] doPostBack_calls_found={len(calls_u)} sample={calls_u[:15]}")
 
-        print(f"[{label}] doPostBack_calls_found={len(calls_unique)} sample={calls_unique[:12]}")
-
-        # Also scan for elements that mention doPostBack / download / xls in href/onclick
-        candidates = []
-        for tag in soup.find_all(True):
-            href = normalize_str(tag.get("href"))
-            onclick = normalize_str(tag.get("onclick"))
-            blob = f"{href} {onclick}".lower()
-            if any(k in blob for k in ["dopostback", "download", "export", ".xls", ".xlsx", "excel", "listbycounty"]):
-                candidates.append((tag.name, normalize_str(tag.get("id")), normalize_str(tag.get("name")), href[:160], onclick[:160]))
-
-        print(f"[{label}] href_onclick_candidates_found={len(candidates)} sample={candidates[:10]}")
         print("---- END CSLB DEBUG ----")
     except Exception as e:
         print(f"[{label}] debug_dump_html failed: {e}")
+
 
 
 def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tuple[Optional[bytes], Optional[bytes]]:
@@ -406,6 +426,15 @@ def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tu
 
     if is_maintenance_or_no_data_page(r1.text):
         return None, None
+    
+    # Step 1.5: Some CSLB pages provide a direct download link (no doPostBack in HTML).
+    direct = _find_direct_download_link(r1.text)
+    if direct:
+        r_dl = session.get(direct, timeout=timeout, headers={"Referer": CSLB_LIST_BY_COUNTY_URL})
+        if r_dl.status_code == 200 and _is_excel_response(r_dl):
+            return r_dl.content, None
+        # If it returned HTML, keep going (maybe needs a postback)
+
 
     # Step 2: Try to trigger Excel export via postback (if present)
     pb = _find_export_postback_target(r1.text)
