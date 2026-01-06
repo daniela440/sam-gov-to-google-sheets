@@ -270,7 +270,7 @@ def _find_export_postback_target(html: str) -> Optional[Tuple[str, str]]:
     if not html:
         return None
 
-    candidates = []
+    candidates: List[Tuple[str, str]] = []
 
     patterns = [
         r"__doPostBack\('([^']+)'\s*,\s*'([^']*)'\)",   # single quotes
@@ -285,15 +285,15 @@ def _find_export_postback_target(html: str) -> Optional[Tuple[str, str]]:
     if not candidates:
         return None
 
-    # Choose best candidate by heuristics:
-    # prefer those that look like download/export/xls/excel
+    # Prefer those that look like download/export/xls/excel
     for target, arg in candidates:
         blob = f"{target} {arg}".lower()
         if any(k in blob for k in ["export", "download", "excel", "xls", "xlsx"]):
             return target, arg
 
-    # fallback: if nothing matches keywords, just return the first
+    # fallback: return the first
     return candidates[0]
+
 
 
     return None
@@ -404,7 +404,7 @@ def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tu
 
     submit = _find_submit_button_name(soup0)  # (name, value) or None
 
-    # Step 1: Apply filters (so the results table/export becomes available)
+    # Step 1: Apply filters + click Download
     post_items = list(form_fields.items())
 
     # multi-select listbox: repeated key is correct
@@ -416,37 +416,41 @@ def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tu
         submit_name, submit_value = submit
         post_items.append((submit_name, submit_value))
     else:
-        # Generic ASP.NET postback fallback
+        # Generic ASP.NET postback fallback (rarely enough on this page)
         post_items.append(("__EVENTTARGET", ""))
         post_items.append(("__EVENTARGUMENT", ""))
 
-r1 = session.post(
-    CSLB_LIST_BY_COUNTY_URL,
-    data=post_items,
-    timeout=timeout,
-    headers={"Referer": CSLB_LIST_BY_COUNTY_URL},
-)
-r1.raise_for_status()
+    r1 = session.post(
+        CSLB_LIST_BY_COUNTY_URL,
+        data=post_items,
+        timeout=timeout,
+        headers={"Referer": CSLB_LIST_BY_COUNTY_URL},
+    )
+    r1.raise_for_status()
 
-print("[POST filters] status=", r1.status_code)
-print("[POST filters] content-type=", r1.headers.get("Content-Type"))
-print("[POST filters] content-disposition=", r1.headers.get("Content-Disposition"))
-print("[POST filters] first_bytes=", r1.content[:16])
+    print("[POST filters] status=", r1.status_code)
+    print("[POST filters] content-type=", r1.headers.get("Content-Type"))
+    print("[POST filters] content-disposition=", r1.headers.get("Content-Disposition"))
+    print("[POST filters] first_bytes=", r1.content[:16])
 
-debug_dump_html("POST filters", r1.text)
+    # If the POST immediately returned an Excel attachment, return it now
+    if _is_excel_response(r1):
+        return r1.content, None
 
+    # Otherwise it is signaled as HTML; debug it
+    debug_dump_html("POST filters", r1.text)
 
     if is_maintenance_or_no_data_page(r1.text):
         return None, None
-    
-    # Step 1.5: Some CSLB pages provide a direct download link (no doPostBack in HTML).
+
+    # Step 1.5: Some pages provide a direct download link
     direct = _find_direct_download_link(r1.text)
     if direct:
         r_dl = session.get(direct, timeout=timeout, headers={"Referer": CSLB_LIST_BY_COUNTY_URL})
         if r_dl.status_code == 200 and _is_excel_response(r_dl):
             return r_dl.content, None
-        # If it returned HTML, keep going (maybe needs a postback)
-
+        if _looks_like_html(r_dl.content):
+            return None, r_dl.content
 
     # Step 2: Try to trigger Excel export via postback (if present)
     pb = _find_export_postback_target(r1.text)
@@ -473,21 +477,15 @@ debug_dump_html("POST filters", r1.text)
         )
         r2.raise_for_status()
 
-        ct = (r2.headers.get("Content-Type") or "").lower()
-        if (
-            ("excel" in ct)
-            or ("spreadsheet" in ct)
-            or ("application/octet-stream" in ct)
-            or _looks_like_xls(r2.content)
-            or _looks_like_xlsx(r2.content)
-        ):
+        if _is_excel_response(r2):
             return r2.content, None
 
         if _looks_like_html(r2.content):
             return None, r2.content
 
-    # No export found; attempt to parse results table from r1
+    # No export found; attempt to parse results table from r1 (likely still HTML)
     return None, r1.content
+
 
 # =============================
 # Parsers
