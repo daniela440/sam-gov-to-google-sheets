@@ -376,6 +376,11 @@ def debug_dump_html(label: str, html: str) -> None:
     except Exception as e:
         print(f"[{label}] debug_dump_html failed: {e}")
 
+def _input_type_by_name(soup: BeautifulSoup, input_name: str) -> str:
+    if not input_name:
+        return ""
+    inp = soup.find("input", attrs={"name": input_name})
+    return normalize_str(inp.get("type")).lower() if inp else ""
 
 
 def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tuple[Optional[bytes], Optional[bytes]]:
@@ -413,12 +418,20 @@ def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tu
     post_items.append((county_select_name, TARGET_COUNTY))
 
     if submit:
-        submit_name, submit_value = submit
-        post_items.append((submit_name, submit_value))
-    else:
-        # Generic ASP.NET postback fallback (rarely enough on this page)
-        post_items.append(("__EVENTTARGET", ""))
+    submit_name, submit_value = submit
+
+    # Always include the button name/value (harmless even if not required)
+    post_items.append((submit_name, submit_value))
+
+    # If CSLB renders it as type="button", we must simulate the JS postback
+    submit_type = _input_type_by_name(soup0, submit_name)
+    if submit_type == "button":
+        post_items.append(("__EVENTTARGET", submit_name))   # WebForms UniqueID uses $
         post_items.append(("__EVENTARGUMENT", ""))
+    else:
+    post_items.append(("__EVENTTARGET", ""))
+    post_items.append(("__EVENTARGUMENT", ""))
+
 
     r1 = session.post(
         CSLB_LIST_BY_COUNTY_URL,
