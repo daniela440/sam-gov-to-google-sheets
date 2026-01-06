@@ -188,18 +188,39 @@ def _guess_class_and_county_select_names(soup: BeautifulSoup) -> Tuple[Optional[
     return None, None
 
 
-def _find_submit_button_name(soup: BeautifulSoup) -> Optional[str]:
-    # Prefer a button that looks like "Search" / "Submit" / "View"
+def _find_submit_button_name(soup: BeautifulSoup) -> Optional[Tuple[str, str]]:
+    """
+    Returns (name, value) for a submit/button that likely triggers results.
+    """
+
+    # Look for input submits
     for inp in soup.find_all("input"):
         if normalize_str(inp.get("type")).lower() != "submit":
             continue
-        val = normalize_str(inp.get("value")).lower()
-        if any(x in val for x in ["search", "submit", "view", "show", "go"]):
-            return inp.get("name")
-    # fallback: any submit
+        name = normalize_str(inp.get("name"))
+        value = normalize_str(inp.get("value"))
+        blob = f"{name} {value}".lower()
+        if any(k in blob for k in ["search", "view", "results", "submit", "filter", "run", "show", "go"]):
+            if name:
+                return name, (value or "Search")
+
+    # Look for <button> elements
+    for btn in soup.find_all("button"):
+        name = normalize_str(btn.get("name"))
+        value = normalize_str(btn.get("value")) or normalize_str(btn.get_text(" ", strip=True))
+        blob = f"{name} {value}".lower()
+        if any(k in blob for k in ["search", "view", "results", "submit", "filter", "run", "show", "go"]):
+            if name:
+                return name, (value or "Search")
+
+    # Fallback: any submit input
     for inp in soup.find_all("input"):
         if normalize_str(inp.get("type")).lower() == "submit":
-            return inp.get("name")
+            name = normalize_str(inp.get("name"))
+            value = normalize_str(inp.get("value"))
+            if name:
+                return name, (value or "Search")
+
     return None
 
 
@@ -236,6 +257,16 @@ def debug_dump_html(label: str, html: str) -> None:
         if tables:
             max_tr = max(len(t.find_all("tr")) for t in tables)
 
+        submits = []
+        for inp in soup.find_all("input"):
+            if normalize_str(inp.get("type")).lower() == "submit":
+                submits.append((normalize_str(inp.get("name")), normalize_str(inp.get("value"))))
+
+        buttons = []
+        for b in soup.find_all("button"):
+            buttons.append((normalize_str(b.get("name")),
+                            normalize_str(b.get("value")) or normalize_str(b.get_text(" ", strip=True))))
+
         print("---- CSLB DEBUG ----")
         print(f"[{label}] title={title!r}")
         print(f"[{label}] maintenance_detected={is_maintenance_or_no_data_page(html)}")
@@ -244,7 +275,6 @@ def debug_dump_html(label: str, html: str) -> None:
         print(f"[{label}] selects_count={len(selects)}")
 
         if selects:
-            # show select names (helps confirm correct field keys)
             names = []
             for s in selects[:12]:
                 nm = normalize_str(s.get("name") or s.get("id") or "")
@@ -252,7 +282,9 @@ def debug_dump_html(label: str, html: str) -> None:
                     names.append(nm)
             print(f"[{label}] select_names_sample={names}")
 
-        # Snippet around common keywords
+        print(f"[{label}] submit_inputs={submits[:10]}")
+        print(f"[{label}] buttons={buttons[:10]}")
+
         lowered = (html or "").lower()
         for kw in ["no records", "no results", "validation", "error", "results", "download", "export", "excel", "__dopostback"]:
             idx = lowered.find(kw)
@@ -261,11 +293,12 @@ def debug_dump_html(label: str, html: str) -> None:
                 end = min(len(html), idx + 300)
                 snippet = re.sub(r"\s+", " ", (html[start:end]))
                 print(f"[{label}] snippet_near_{kw!r}: {snippet[:420]}")
-                break  # just show first match to keep logs readable
+                break
 
         print("---- END CSLB DEBUG ----")
     except Exception as e:
         print(f"[{label}] debug_dump_html failed: {e}")
+
 
 
 def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tuple[Optional[bytes], Optional[bytes]]:
@@ -290,24 +323,23 @@ def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tu
 
     class_select_name, county_select_name = _guess_class_and_county_select_names(soup0)
     if not class_select_name or not county_select_name:
-        # If structure changed or degraded, exit cleanly
         return None, None
 
-    submit_name = _find_submit_button_name(soup0)
+    submit = _find_submit_button_name(soup0)  # (name, value) or None
 
     # Step 1: Apply filters (so the results table/export becomes available)
     post_items = list(form_fields.items())
 
+    # multi-select listbox: repeated key is correct
     for c in TARGET_CLASSIFICATIONS:
         post_items.append((class_select_name, c))
-
     post_items.append((county_select_name, TARGET_COUNTY))
 
-    if submit_name:
-        # Some ASP.NET forms care about the submit button name being present
-        post_items.append((submit_name, "Search"))
+    if submit:
+        submit_name, submit_value = submit
+        post_items.append((submit_name, submit_value))
     else:
-        # Generic ASP.NET postback
+        # Generic ASP.NET postback fallback
         post_items.append(("__EVENTTARGET", ""))
         post_items.append(("__EVENTARGUMENT", ""))
 
@@ -331,6 +363,12 @@ def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tu
         form_fields_2 = _extract_aspnet_form_fields(soup1)
 
         export_items = list(form_fields_2.items())
+
+        # Keep selections consistent (sometimes required)
+        for c in TARGET_CLASSIFICATIONS:
+            export_items.append((class_select_name, c))
+        export_items.append((county_select_name, TARGET_COUNTY))
+
         export_items.append(("__EVENTTARGET", target))
         export_items.append(("__EVENTARGUMENT", arg or ""))
 
@@ -342,7 +380,6 @@ def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tu
         )
         r2.raise_for_status()
 
-        # If we got an actual file (not HTML), return it
         ct = (r2.headers.get("Content-Type") or "").lower()
         if (
             ("excel" in ct)
@@ -353,7 +390,6 @@ def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tu
         ):
             return r2.content, None
 
-        # If it's HTML but includes a table, fall back to table parse
         if _looks_like_html(r2.content):
             return None, r2.content
 
