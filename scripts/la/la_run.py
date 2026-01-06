@@ -420,14 +420,21 @@ def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tu
         post_items.append(("__EVENTTARGET", ""))
         post_items.append(("__EVENTARGUMENT", ""))
 
-    r1 = session.post(
-        CSLB_LIST_BY_COUNTY_URL,
-        data=post_items,
-        timeout=timeout,
-        headers={"Referer": CSLB_LIST_BY_COUNTY_URL},
-    )
-    r1.raise_for_status()
-    debug_dump_html("POST filters", r1.text)
+r1 = session.post(
+    CSLB_LIST_BY_COUNTY_URL,
+    data=post_items,
+    timeout=timeout,
+    headers={"Referer": CSLB_LIST_BY_COUNTY_URL},
+)
+r1.raise_for_status()
+
+print("[POST filters] status=", r1.status_code)
+print("[POST filters] content-type=", r1.headers.get("Content-Type"))
+print("[POST filters] content-disposition=", r1.headers.get("Content-Disposition"))
+print("[POST filters] first_bytes=", r1.content[:16])
+
+debug_dump_html("POST filters", r1.text)
+
 
     if is_maintenance_or_no_data_page(r1.text):
         return None, None
