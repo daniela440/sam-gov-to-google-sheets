@@ -1,4 +1,4 @@
-name: LA - Pull CSLB LA County Contractors into Google Sheet
+name: CA - Pull CEQAnet 2026 Filings into Google Sheet
 
 on:
   workflow_dispatch:
@@ -22,8 +22,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install playwright
+          python -m playwright install --with-deps chromium
 
-      - name: Run LA pipeline (CSLB LA County)
+      - name: Run CA pipeline (CEQAnet)
         env:
           LA_GOOGLE_CREDENTIALS_JSON: ${{ secrets.LA_GOOGLE_CREDENTIALS_JSON }}
 
@@ -32,11 +34,7 @@ jobs:
           LA_TAB_NAME: Awards_Raw_LA
 
           # Output controls
-          LA_MAX_NEW: "200"          # how many new licenses to append per run
-          LA_SLEEP_SECONDS: "0.2"    # polite pacing
-
-          # Enrichment controls (safe daily cap)
-          LA_ENABLE_DDG: "true"
-          LA_DDG_DAILY_CAP: "10"
+          LA_MAX_NEW: "2000"
+          LA_SLEEP_SECONDS: "0.05"
         run: |
           python scripts/la/la_run.py
