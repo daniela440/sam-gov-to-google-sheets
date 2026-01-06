@@ -1,50 +1,38 @@
 import os
+import io
 import json
 import time
 import hashlib
-import re
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 
-import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
+import openpyxl  # .xlsx
+import xlrd      # .xls (BIFF)
+
+from playwright.sync_api import sync_playwright
+
 
 # =============================
-# CONFIG (LA City Open Data - Building Permits)
+# CONFIG
 # =============================
 
-# Socrata dataset id
-DATASET_ID = "pi9x-tg5x"
+CEQANET_URL = "https://ceqanet.lci.ca.gov/"
 
-# SODA endpoint (JSON)
-SODA_URL = f"https://data.lacity.org/resource/{DATASET_ID}.json"
+# Search window = all of 2026
+DATE_START = "01/01/2026"
+DATE_END   = "12/31/2026"
 
-# Optional (rate limits are nicer if you provide an app token; not required)
-SOCRATA_APP_TOKEN = os.environ.get("LA_SOCRATA_APP_TOKEN", "").strip()
+# Reuse your existing LA env vars (so you don't need new secrets)
+SHEET_ID = os.environ.get("LA_SHEET_ID")
+TAB_NAME = os.environ.get("LA_TAB_NAME")
+CREDS_ENV = "LA_GOOGLE_CREDENTIALS_JSON"
 
-# Filter year (default 2026)
-TARGET_YEAR = int(os.environ.get("LA_PERMITS_YEAR", "2026"))
-
-# Paging / throttling
-PAGE_SIZE = int(os.environ.get("LA_PAGE_SIZE", "5000"))        # Socrata supports large pages; 5k is reasonable
-SLEEP_SECONDS = float(os.environ.get("LA_SLEEP_SECONDS", "0.2"))
-
-# Your output caps
-MAX_NEW = int(os.environ.get("LA_MAX_NEW", "200"))
-
-# Keep your existing allowlist (optional); permits don't have NAICS, but we can map by permit_type if you want later
-ALLOWED_NAICS = {"238210", "236220", "237310", "238220", "238120"}
-
-# Minimal mapping — permits dataset does not contain NAICS; we populate blank for now
-NAICS_DESC = {
-    "238210": "Electrical Contractors and Other Wiring Installation Contractors",
-    "236220": "Commercial and Institutional Building Construction",
-    "237310": "Highway, Street, and Bridge Construction",
-    "238220": "Plumbing, Heating, and Air-Conditioning Contractors",
-    "238120": "Structural Steel and Precast Concrete Contractors",
-}
+# Controls
+MAX_NEW = int(os.environ.get("LA_MAX_NEW", "2000"))
+SLEEP_SECONDS = float(os.environ.get("LA_SLEEP_SECONDS", "0.05"))
 
 
 # =============================
@@ -59,51 +47,10 @@ def normalize_str(x) -> str:
     return str(x).strip() if x is not None else ""
 
 
-def safe_join(parts: List[str], sep: str = " ") -> str:
-    return sep.join([p for p in (normalize_str(x) for x in parts) if p])
-
-
-def parse_date_any(s: str) -> Optional[datetime]:
-    """
-    Socrata often returns ISO strings like:
-      '2026-01-15T00:00:00.000'
-    Sometimes they can be plain text; we do best-effort.
-    """
-    s = normalize_str(s)
-    if not s:
-        return None
-    try:
-        # normalize Z if present
-        s2 = s.replace("Z", "+00:00")
-        # If no timezone, treat as naive local -> keep naive
-        return datetime.fromisoformat(s2)
-    except Exception:
-        # fallback: try first 10 chars YYYY-MM-DD
-        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", s)
-        if m:
-            try:
-                return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-            except Exception:
-                return None
-    return None
-
-
-def header_map(ws) -> dict:
-    headers = ws.row_values(1)
-    if not headers:
-        raise RuntimeError("Row 1 headers are empty. Paste your column headers in row 1.")
-    return {h: i + 1 for i, h in enumerate(headers)}  # 1-based
-
-
-def load_existing_award_ids(ws) -> set:
-    col_values = ws.col_values(1)  # Column A = Award ID
-    return {v.strip() for v in col_values[1:] if v and v.strip()}
-
-
 def get_gspread_client():
-    creds_json = os.environ.get("LA_GOOGLE_CREDENTIALS_JSON")
+    creds_json = os.environ.get(CREDS_ENV)
     if not creds_json:
-        raise RuntimeError("Missing LA_GOOGLE_CREDENTIALS_JSON secret")
+        raise RuntimeError(f"Missing {CREDS_ENV} secret/env var")
     creds_dict = json.loads(creds_json)
 
     scopes = [
@@ -114,74 +61,210 @@ def get_gspread_client():
     return gspread.authorize(credentials)
 
 
-# =============================
-# LA Permits fetch (Socrata SODA)
-# =============================
-
-def socrata_get(params: dict, timeout: int = 60) -> List[dict]:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    if SOCRATA_APP_TOKEN:
-        headers["X-App-Token"] = SOCRATA_APP_TOKEN
-
-    r = requests.get(SODA_URL, params=params, headers=headers, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+def header_map(ws) -> dict:
+    headers = ws.row_values(1)
+    if not headers:
+        raise RuntimeError("Row 1 headers are empty. Paste your column headers in row 1.")
+    return {h: i + 1 for i, h in enumerate(headers)}  # 1-based
 
 
-def fetch_permits_for_year(year: int, max_rows: int) -> List[dict]:
-    """
-    Pull rows where issue_date is within [year-01-01, year-12-31].
-    We page via $limit / $offset.
-    """
-    start = f"{year}-01-01T00:00:00.000"
-    end = f"{year}-12-31T23:59:59.999"
+def load_existing_ids(ws, id_col: int = 1) -> set:
+    col_values = ws.col_values(id_col)
+    return {v.strip() for v in col_values[1:] if v and v.strip()}
 
-    out: List[dict] = []
-    offset = 0
 
-    # We only request the columns we need (faster, less brittle)
-    select_cols = ",".join([
-        "permit_nbr",
-        "primary_address",
-        "zip_code",
-        "permit_group",
-        "permit_type",
-        "permit_sub_type",
-        "use_desc",
-        "submitted_date",
-        "issue_date",
-        "status_desc",
-        "status_date",
-        "valuation",
-        "square_footage",
-        "work_desc",
-        "lat",
-        "lon",
-    ])
+def _looks_like_xlsx(b: bytes) -> bool:
+    return len(b) >= 2 and b[0:2] == b"PK"
 
-    where = f"issue_date >= '{start}' AND issue_date <= '{end}'"
 
-    while len(out) < max_rows:
-        limit = min(PAGE_SIZE, max_rows - len(out))
-        params = {
-            "$select": select_cols,
-            "$where": where,
-            "$order": "issue_date DESC",
-            "$limit": str(limit),
-            "$offset": str(offset),
-        }
+def _looks_like_xls(b: bytes) -> bool:
+    return len(b) >= 8 and b[0:8] == bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])
 
-        batch = socrata_get(params=params)
-        if not batch:
-            break
 
-        out.extend(batch)
-        offset += len(batch)
+def parse_excel_xlsx(x: bytes) -> List[Dict[str, str]]:
+    wb = openpyxl.load_workbook(io.BytesIO(x), read_only=True, data_only=True)
+    ws = wb.worksheets[0]
+    rows_iter = ws.iter_rows(values_only=True)
 
-        print(f"[SODA] fetched={len(out)} offset={offset} last_issue_date={batch[-1].get('issue_date','')}")
-        time.sleep(SLEEP_SECONDS)
-
+    headers: List[str] = []
+    out: List[Dict[str, str]] = []
+    for idx, row in enumerate(rows_iter):
+        values = [normalize_str(v) for v in row]
+        if idx == 0:
+            headers = values
+            continue
+        if not any(values):
+            continue
+        if len(values) < len(headers):
+            values += [""] * (len(headers) - len(values))
+        out.append({headers[i]: values[i] for i in range(min(len(headers), len(values)))})
     return out
+
+
+def parse_excel_xls(x: bytes) -> List[Dict[str, str]]:
+    book = xlrd.open_workbook(file_contents=x)
+    sheet = book.sheet_by_index(0)
+
+    if sheet.nrows < 1:
+        return []
+
+    headers = [normalize_str(sheet.cell_value(0, c)) for c in range(sheet.ncols)]
+    out: List[Dict[str, str]] = []
+    for r in range(1, sheet.nrows):
+        rowvals = [normalize_str(sheet.cell_value(r, c)) for c in range(sheet.ncols)]
+        if not any(rowvals):
+            continue
+        if len(rowvals) < len(headers):
+            rowvals += [""] * (len(headers) - len(rowvals))
+        out.append({headers[i]: rowvals[i] for i in range(min(len(headers), len(rowvals)))})
+    return out
+
+
+def parse_download_bytes(download_bytes: bytes) -> List[Dict[str, str]]:
+    # Excel formats
+    if _looks_like_xlsx(download_bytes):
+        return parse_excel_xlsx(download_bytes)
+    if _looks_like_xls(download_bytes):
+        return parse_excel_xls(download_bytes)
+
+    # CSV fallback
+    text = download_bytes.decode("utf-8", errors="ignore").strip()
+    if "," in text and "\n" in text:
+        import csv
+        rows = list(csv.DictReader(io.StringIO(text)))
+        return [{k: normalize_str(v) for k, v in r.items()} for r in rows]
+
+    return []
+
+
+def pick(row: Dict[str, str], candidates: List[str]) -> str:
+    lower_map = {k.lower(): k for k in row.keys()}
+    for c in candidates:
+        k = lower_map.get(c.lower())
+        if k:
+            v = normalize_str(row.get(k))
+            if v:
+                return v
+    return ""
+
+
+# =============================
+# CEQAnet automation (Playwright)
+# =============================
+
+def ceqanet_download_statewide_2026(timeout_ms: int = 120_000) -> bytes:
+    """
+    Drives CEQAnet Advanced Search and downloads results for statewide California for 2026 date range.
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(accept_downloads=True)
+        page = context.new_page()
+
+        page.goto(CEQANET_URL, wait_until="domcontentloaded", timeout=timeout_ms)
+
+        # Go to Advanced Search
+        advanced_selectors = [
+            "text=Advanced Search",
+            "a:has-text('Advanced Search')",
+            "button:has-text('Advanced Search')",
+            "text=Advanced",
+        ]
+        for sel in advanced_selectors:
+            try:
+                page.locator(sel).first.click(timeout=10_000)
+                break
+            except Exception:
+                continue
+
+        page.wait_for_timeout(800)
+
+        # Fill date range. Labels differ across versions; use multiple fallbacks.
+        def try_fill_by_label(label_frag: str, value: str) -> bool:
+            try:
+                page.get_by_label(label_frag, exact=False).fill(value, timeout=5_000)
+                return True
+            except Exception:
+                return False
+
+        # Best-effort: fill 2 date fields
+        ok1 = (
+            try_fill_by_label("Start", DATE_START) or
+            try_fill_by_label("From", DATE_START) or
+            try_fill_by_label("Begin", DATE_START)
+        )
+        ok2 = (
+            try_fill_by_label("End", DATE_END) or
+            try_fill_by_label("To", DATE_END)
+        )
+
+        # If label matching fails, fill the first two visible text inputs that look empty.
+        if not (ok1 and ok2):
+            inputs = page.locator("input[type='text']:visible")
+            count = inputs.count()
+            if count >= 2:
+                inputs.nth(0).fill(DATE_START)
+                inputs.nth(1).fill(DATE_END)
+
+        # Ensure statewide by clearing County/City if present
+        for label in ["County", "City"]:
+            try:
+                dd = page.get_by_label(label, exact=False)
+                dd.select_option("")  # clear
+            except Exception:
+                pass
+
+        # Click Search
+        search_selectors = [
+            "button:has-text('Search')",
+            "input[value='Search']",
+            "text=Search",
+        ]
+        clicked = False
+        for sel in search_selectors:
+            try:
+                page.locator(sel).first.click(timeout=10_000)
+                clicked = True
+                break
+            except Exception:
+                continue
+        if not clicked:
+            page.screenshot(path="ceqanet_debug_search_click.png", full_page=True)
+            raise RuntimeError("Could not click Search in CEQAnet Advanced Search. Saved ceqanet_debug_search_click.png")
+
+        # Wait for results to render
+        page.wait_for_timeout(2000)
+
+        # Click Export/Download
+        download_selectors = [
+            "button:has-text('Export')",
+            "button:has-text('Download')",
+            "a:has-text('Export')",
+            "a:has-text('Download')",
+            "text=Excel",
+            "text=CSV",
+        ]
+
+        download = None
+        for sel in download_selectors:
+            try:
+                with page.expect_download(timeout=30_000) as dl_info:
+                    page.locator(sel).first.click(timeout=10_000)
+                download = dl_info.value
+                break
+            except Exception:
+                continue
+
+        if download is None:
+            page.screenshot(path="ceqanet_debug_no_export.png", full_page=True)
+            html = page.content()
+            print("[CEQANET] No export/download control found. Saved ceqanet_debug_no_export.png")
+            print("[CEQANET] Page content length:", len(html))
+            raise RuntimeError("CEQAnet search ran, but export/download control was not found.")
+
+        data = download.path().read_bytes()  # type: ignore
+        browser.close()
+        return data
 
 
 # =============================
@@ -189,115 +272,68 @@ def fetch_permits_for_year(year: int, max_rows: int) -> List[dict]:
 # =============================
 
 def main():
-    sheet_id = os.environ.get("LA_SHEET_ID")
-    tab_name = os.environ.get("LA_TAB_NAME")
-    if not sheet_id or not tab_name:
-        raise RuntimeError("Missing LA_SHEET_ID or LA_TAB_NAME")
+    if not SHEET_ID or not TAB_NAME:
+        raise RuntimeError("Missing LA_SHEET_ID or LA_TAB_NAME env vars")
 
-    # Connect sheet
     gc = get_gspread_client()
-    sh = gc.open_by_key(sheet_id)
-    ws = sh.worksheet(tab_name)
+    sh = gc.open_by_key(SHEET_ID)
+    ws = sh.worksheet(TAB_NAME)
+
     hmap = header_map(ws)
-    existing_ids = load_existing_award_ids(ws)
+    existing_ids = load_existing_ids(ws, id_col=1)
 
-    print(f"Downloading LA City building permits for year={TARGET_YEAR} (dataset={DATASET_ID}) ...")
+    print("CEQAnet statewide (California) | pulling records with date range in 2026...")
+    download_bytes = ceqanet_download_statewide_2026()
+    rows = parse_download_bytes(download_bytes)
 
-    permits = fetch_permits_for_year(year=TARGET_YEAR, max_rows=MAX_NEW * 5)  # fetch extra; we dedupe and filter
-    print(f"Fetched {len(permits)} raw permits from LA Open Data.")
-
-    if not permits:
-        print("No permits returned for that year filter. Try changing LA_PERMITS_YEAR or verify issue_date logic.")
+    print(f"Downloaded + parsed rows: {len(rows)}")
+    if not rows:
+        print("No rows parsed. Export format may have changed or returned empty.")
         return
 
     now = utc_now_str()
-    rows_to_append = []
+    rows_to_append: List[List[str]] = []
     appended = 0
 
-    # Quick debug: show a couple of issue dates
-    sample_dates = [p.get("issue_date", "") for p in permits[:5]]
-    print("[DEBUG] sample issue_date values:", sample_dates)
-
-    for p in permits:
+    for r in rows:
         if appended >= MAX_NEW:
             break
 
-        permit_nbr = normalize_str(p.get("permit_nbr"))
-        if not permit_nbr:
-            continue
+        # Typical CEQAnet columns (varies by export)
+        sch = pick(r, ["SCH Number", "SCH#", "SCH", "State Clearinghouse Number"])
+        title = pick(r, ["Project Title", "Title", "Project"])
+        lead = pick(r, ["Lead Agency", "Agency"])
+        county = pick(r, ["County"])
+        city = pick(r, ["City"])
+        doc_type = pick(r, ["Document Type", "Doc Type", "Type"])
+        received = pick(r, ["Received", "Received Date", "Date Received"])
+        posted = pick(r, ["Posted", "Posted Date", "Date Posted", "Published", "Publication Date"])
+        location = pick(r, ["Location", "Project Location", "Address"])
+        desc = pick(r, ["Description", "Project Description"])
 
-        award_id = permit_nbr
+        stable_key = sch or f"{title}|{lead}|{posted}|{received}|{county}|{city}"
+        award_id = hashlib.md5(stable_key.encode("utf-8")).hexdigest()
+
         if award_id in existing_ids:
             continue
 
-        issue_date_raw = normalize_str(p.get("issue_date"))
-        issue_dt = parse_date_any(issue_date_raw)
-
-        # Hard safety check: ensure it really matches the TARGET_YEAR
-        if not issue_dt or issue_dt.year != TARGET_YEAR:
-            continue
-
-        addr = normalize_str(p.get("primary_address"))
-        zip_code = normalize_str(p.get("zip_code"))
-        permit_group = normalize_str(p.get("permit_group"))
-        permit_type = normalize_str(p.get("permit_type"))
-        permit_sub_type = normalize_str(p.get("permit_sub_type"))
-        use_desc = normalize_str(p.get("use_desc"))
-        status_desc = normalize_str(p.get("status_desc"))
-        valuation = normalize_str(p.get("valuation"))
-        sqft = normalize_str(p.get("square_footage"))
-        work_desc = normalize_str(p.get("work_desc"))
-
-        lat = normalize_str(p.get("lat"))
-        lon = normalize_str(p.get("lon"))
-
-        # Recipient/company is not provided in this dataset (it’s a permit record, not a license registry)
-        business = ""
-
-        hq_addr = safe_join([addr, f"CA {zip_code}".strip()], sep=", ").strip(", ").strip()
-        recipient_id = hashlib.md5(award_id.encode("utf-8")).hexdigest()
-
-        # Links
-        # Dataset landing page + basic query via search
-        dataset_page = f"https://data.lacity.org/d/{DATASET_ID}"
-        web_search = f"https://www.google.com/search?q={requests.utils.quote(permit_nbr)}+site:data.lacity.org+pi9x-tg5x"
-
+        # Map into your existing sheet schema (best-effort)
         values = {
             "Award ID": award_id,
-            "Recipient (Company)": business,
-            "Recipient UEI": "",
-            "Parent Recipient UEI": "",
-            "Parent Recipient DUNS": "",
-            "Recipient (HQ) Address": hq_addr,
-
-            # Keep your downstream anchors; start/end are not directly in this dataset
-            "Start Date": issue_dt.strftime("%Y-%m-%d"),
+            "Recipient (Company)": "",  # CEQAnet is project-level, not contractor-level
+            "Recipient (HQ) Address": location,
+            "Start Date": "2026-01-01",  # marker for your “2026 pipeline”
             "End Date": "",
-
             "Last Modified Date": now,
-            "Award Amount (Obligated)": valuation,  # closest analog; it's permit valuation
-
+            "Award Amount (Obligated)": "",
             "NAICS Code": "",
             "NAICS Description": "",
-
-            "Awarding Agency": "LA City Open Data (LADBS Building Permits Issued)",
-            "Place of Performance": "Los Angeles, CA",
-            "Description": safe_join(
-                [
-                    f"Permit {permit_nbr}",
-                    f"Group={permit_group}" if permit_group else "",
-                    f"Type={permit_type}" if permit_type else "",
-                    f"SubType={permit_sub_type}" if permit_sub_type else "",
-                    f"Use={use_desc}" if use_desc else "",
-                    f"Status={status_desc}" if status_desc else "",
-                    f"SqFt={sqft}" if sqft else "",
-                    f"Work={work_desc}" if work_desc else "",
-                ],
-                sep=" | "
-            ),
-            "Award Link": dataset_page,
+            "Awarding Agency": lead,
+            "Place of Performance": ", ".join([x for x in [city, county, "CA"] if x]),
+            "Description": f"{title} | {doc_type} | Posted={posted} | Received={received} | {desc}".strip(),
+            "Award Link": "",
             "Recipient Profile Link": "",
-            "Web Search Link": web_search,
+            "Web Search Link": "",
 
             "Company Website": "",
             "Company Phone": "",
@@ -307,35 +343,30 @@ def main():
             "Responsible Person Email": "",
             "Responsible Person Phone": "",
 
-            "confidence_score": "70",
-            "prediction_rationale": "la_city_open_data_permits(+70)",
+            "confidence_score": "60",
+            "prediction_rationale": "ceqanet_statewide_advanced_search(+60)",
             "target_flag": "TRUE",
-            "recipient_id": recipient_id,
-            "data_source": "LA City Open Data",
+            "recipient_id": award_id,
+            "data_source": "CEQAnet (CA State Clearinghouse)",
             "data_confidence_level": "Medium",
             "last_verified_date": now,
-            "notes": safe_join(
-                [
-                    f"issue_date={issue_date_raw}" if issue_date_raw else "",
-                    f"lat={lat},lon={lon}" if lat and lon else "",
-                ],
-                sep="; "
-            ),
+            "notes": f"SCH={sch}; DocType={doc_type}; Lead={lead}",
         }
 
-        ordered_row = [""] * len(hmap)
+        ordered = [""] * len(hmap)
         for header, col_index in hmap.items():
-            ordered_row[col_index - 1] = values.get(header, "")
+            ordered[col_index - 1] = values.get(header, "")
 
-        rows_to_append.append(ordered_row)
+        rows_to_append.append(ordered)
         existing_ids.add(award_id)
         appended += 1
+        time.sleep(SLEEP_SECONDS)
 
     if rows_to_append:
         ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
-        print(f"✅ Appended {len(rows_to_append)} rows into {tab_name}.")
+        print(f"✅ Appended {len(rows_to_append)} rows into {TAB_NAME}.")
     else:
-        print("No rows appended. Either everything was already present (dedupe) or the year filter returned no new rows.")
+        print("No new rows appended (deduped or empty export).")
 
     print("Done.")
 
