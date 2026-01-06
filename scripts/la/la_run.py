@@ -137,7 +137,9 @@ def looks_like_construction_project(title: str, desc: str, dev_type: str) -> boo
 def _click_first(page, selectors: List[str], timeout_ms: int = 10_000) -> bool:
     for sel in selectors:
         try:
-            page.locator(sel).first.click(timeout=timeout_ms)
+            loc = page.locator(sel).first
+            loc.wait_for(state="visible", timeout=timeout_ms)
+            loc.click(timeout=timeout_ms)
             return True
         except Exception:
             continue
@@ -155,32 +157,92 @@ def _fill_date_field(page, label_candidates: List[str], value: str) -> bool:
     return False
 
 
-def ceqanet_download_csv_for_2026(timeout_ms: int = 150_000) -> Tuple[bytes, str]:
+def ceqanet_download_csv_for_2026(timeout_ms: int = 180_000) -> Tuple[bytes, str]:
     """
     Runs Advanced Search for the date range and downloads the CSV.
     Returns (csv_bytes, results_page_url).
+
+    FIXES:
+      - Do not depend on clicking "Advanced Search" from homepage.
+      - Try direct Advanced Search URLs first.
+      - Fall back to robust click strategies.
+      - Verify we are on the Advanced Search form by waiting for "Get Results".
     """
+    advanced_url_candidates = [
+        # Common ASP.NET MVC-ish patterns (CEQAnet has used these variants historically)
+        "https://ceqanet.lci.ca.gov/Search/AdvancedSearch",
+        "https://ceqanet.lci.ca.gov/Search/Advanced",
+        "https://ceqanet.lci.ca.gov/AdvancedSearch",
+        "https://ceqanet.lci.ca.gov/search/advancedsearch",
+        "https://ceqanet.lci.ca.gov/search/advanced",
+    ]
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(accept_downloads=True)
         page = context.new_page()
 
+        # Step 1: land on site
         page.goto(CEQANET_URL, wait_until="domcontentloaded", timeout=timeout_ms)
-
-        # Go to Advanced Search
-        ok_adv = _click_first(page, [
-            "text=Advanced Search",
-            "a:has-text('Advanced Search')",
-            "button:has-text('Advanced Search')",
-            "text=Advanced",
-        ])
-        if not ok_adv:
-            page.screenshot(path="ceqanet_debug_no_advanced.png", full_page=True)
-            raise RuntimeError("Could not open Advanced Search. Saved ceqanet_debug_no_advanced.png")
-
         page.wait_for_timeout(800)
 
-        # Fill Start Range / End Range (dd.mm.yyyy in your screenshots)
+        # Step 2: try direct Advanced Search URLs
+        on_advanced = False
+        for u in advanced_url_candidates:
+            try:
+                page.goto(u, wait_until="domcontentloaded", timeout=45_000)
+                # Confirm by presence of the "Get Results" button or Start Range label
+                if page.locator("text=Get Results").first.is_visible(timeout=3_000) or \
+                   page.locator("text=Start Range").first.is_visible(timeout=3_000):
+                    on_advanced = True
+                    break
+            except Exception:
+                continue
+
+        # Step 3: click fallback if direct URLs failed
+        if not on_advanced:
+            # Go back to home and try clicking from nav/header in multiple ways
+            page.goto(CEQANET_URL, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(1200)
+
+            # These match your screenshots: top nav contains “Advanced Search”
+            clicked = False
+
+            # Role-based click is often the most reliable
+            try:
+                page.get_by_role("link", name="Advanced Search", exact=False).click(timeout=8_000)
+                clicked = True
+            except Exception:
+                pass
+
+            if not clicked:
+                clicked = _click_first(page, [
+                    "a:has-text('Advanced Search')",
+                    "text=Advanced Search",
+                    "a[href*='Advanced' i]",
+                    "a[href*='advanced' i]",
+                    "a:has-text('Advanced')",
+                    "text=Advanced",
+                ], timeout_ms=10_000)
+
+            if not clicked:
+                page.screenshot(path="ceqanet_debug_no_advanced.png", full_page=True)
+                raise RuntimeError(
+                    "Could not open Advanced Search. Saved ceqanet_debug_no_advanced.png"
+                )
+
+        # Step 4: verify Advanced Search form is present
+        try:
+            page.wait_for_selector("text=Get Results", timeout=30_000)
+        except PWTimeoutError:
+            page.screenshot(path="ceqanet_debug_not_on_advanced.png", full_page=True)
+            raise RuntimeError(
+                "Navigation did not land on Advanced Search form. Saved ceqanet_debug_not_on_advanced.png"
+            )
+
+        page.wait_for_timeout(500)
+
+        # Step 5: Fill date range (dd.mm.yyyy)
         ok_start = _fill_date_field(page, ["Start Range", "Start", "From", "Begin"], DATE_START)
         ok_end   = _fill_date_field(page, ["End Range", "End", "To"], DATE_END)
 
@@ -191,31 +253,31 @@ def ceqanet_download_csv_for_2026(timeout_ms: int = 150_000) -> Tuple[bytes, str
                 inputs.nth(0).fill(DATE_START)
                 inputs.nth(1).fill(DATE_END)
 
-        # Ensure statewide: leave County/City as (Any) if possible
-        # We do NOT force a specific county.
-        # (If you later want per-county runs, do it via env var.)
-        # No action required unless a value is already selected by browser state.
+        # IMPORTANT: We want ALL construction-ish work; we do NOT filter Development Type here.
+        # Leave County/City as (Any) for statewide.
 
-        # Click "Get Results" (THIS is the key difference from your broken version)
+        # Step 6: Click "Get Results"
         clicked = _click_first(page, [
             "button:has-text('Get Results')",
             "input[value='Get Results']",
             "text=Get Results",
-        ])
+        ], timeout_ms=12_000)
         if not clicked:
             page.screenshot(path="ceqanet_debug_no_get_results.png", full_page=True)
             raise RuntimeError("Could not click Get Results. Saved ceqanet_debug_no_get_results.png")
 
-        # Wait for results page content
+        # Step 7: Wait for results page
+        page.wait_for_timeout(1500)
+
+        # Step 8: Download CSV
         try:
-            page.wait_for_selector("text=Search Results", timeout=40_000)
+            page.wait_for_selector("text=Download CSV", timeout=30_000)
         except PWTimeoutError:
-            # Still might be results without that heading; continue
-            pass
+            page.screenshot(path="ceqanet_debug_results_no_download.png", full_page=True)
+            raise RuntimeError(
+                "Results loaded, but Download CSV button not found. Saved ceqanet_debug_results_no_download.png"
+            )
 
-        page.wait_for_timeout(1000)
-
-        # Download CSV
         download = None
         try:
             with page.expect_download(timeout=60_000) as dl_info:
@@ -223,10 +285,11 @@ def ceqanet_download_csv_for_2026(timeout_ms: int = 150_000) -> Tuple[bytes, str
                     "text=Download CSV",
                     "button:has-text('Download CSV')",
                     "a:has-text('Download CSV')",
-                ], timeout_ms=10_000)
+                    "a[href*='csv' i]",
+                ], timeout_ms=12_000)
                 if not ok_dl:
                     page.screenshot(path="ceqanet_debug_no_download_csv.png", full_page=True)
-                    raise RuntimeError("Results loaded, but could not find Download CSV button.")
+                    raise RuntimeError("Could not click Download CSV on results page.")
             download = dl_info.value
         except Exception as e:
             page.screenshot(path="ceqanet_debug_download_failed.png", full_page=True)
