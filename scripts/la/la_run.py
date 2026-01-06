@@ -333,6 +333,43 @@ def debug_dump_html(label: str, html: str) -> None:
         print("---- END CSLB DEBUG ----")
     except Exception as e:
         print(f"[{label}] debug_dump_html failed: {e}")
+def _print_selected_state(label: str, html: str, class_select_name: str, county_select_name: str) -> None:
+    try:
+        soup = BeautifulSoup(html or "", "lxml")
+
+        def selected_values(select_name: str) -> List[str]:
+            sel = soup.find("select", attrs={"name": select_name})
+            if not sel:
+                return []
+            chosen = []
+            for opt in sel.find_all("option"):
+                if opt.has_attr("selected"):
+                    chosen.append(normalize_str(opt.get("value")) or normalize_str(opt.get_text(" ", strip=True)))
+            return chosen
+
+        cls = selected_values(class_select_name)
+        cty = selected_values(county_select_name)
+
+        print(f"[{label}] server_selected_classifications_count={len(cls)} sample={cls[:10]}")
+        print(f"[{label}] server_selected_counties_count={len(cty)} sample={cty[:10]}")
+    except Exception as e:
+        print(f"[{label}] _print_selected_state failed: {e}")
+
+
+def _extract_validation_snippet(html: str, width: int = 250) -> str:
+    """
+    Grabs a small snippet around common validation words so you can see exactly what CSLB is complaining about.
+    """
+    t = html or ""
+    low = t.lower()
+    needles = ["please select", "required", "validation", "error"]
+    for n in needles:
+        idx = low.find(n)
+        if idx != -1:
+            start = max(0, idx - width)
+            end = min(len(t), idx + width)
+            return t[start:end].replace("\n", " ").replace("\r", " ")
+    return ""
 
 
 def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tuple[Optional[bytes], Optional[bytes]]:
@@ -356,81 +393,119 @@ def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tu
     if not submit:
         print("Could not locate Download button control.")
         return None, None
-
     submit_name, submit_value = submit
 
-    # Resolve option VALUES exactly as the page defines them
-    class_opts = _get_select_options(soup0, class_select_name)
+    # Resolve options (values + texts)
+    class_opts = _get_select_options(soup0, class_select_name)   # (value, text)
     county_opts = _get_select_options(soup0, county_select_name)
 
+    # Primary attempt: use actual option VALUES (what you already do)
     class_values: List[str] = []
+    class_texts: List[str] = []
     for c in TARGET_CLASSIFICATIONS:
         v = _resolve_option_value(class_opts, c)
         if v:
             class_values.append(v)
+        class_texts.append(c)  # the visible text you want as fallback
 
     county_value = _resolve_option_value(county_opts, TARGET_COUNTY)
+    county_text = TARGET_COUNTY
 
     print("[RESOLVE] class_values_count=", len(class_values), "sample=", class_values[:5])
     print("[RESOLVE] county_value=", county_value)
 
     if not class_values or not county_value:
-        print("Failed to resolve classification/county option values from the page. CSLB may have changed option labels/values.")
+        print("Failed to resolve option values from the page.")
         return None, None
 
-    # Pull postback target/arg from onclick if present (more reliable than guessing)
+    # Pull postback target/arg from onclick
     btn = soup0.find("input", attrs={"name": submit_name})
     onclick = normalize_str(btn.get("onclick")) if btn else ""
     pb_target, pb_arg = _parse_postback_from_onclick(onclick)
 
-    # Build POST payload WITHOUT duplicate empty select keys
-    post_items = [
-        (k, v) for (k, v) in form_fields.items()
-        if k not in {class_select_name, county_select_name, "__EVENTTARGET", "__EVENTARGUMENT"}
-    ]
+    def do_post(use_text_fallback: bool) -> requests.Response:
+        # IMPORTANT: remove any existing select keys and event keys first
+        post_items = [
+            (k, v) for (k, v) in form_fields.items()
+            if k not in {class_select_name, county_select_name, "__EVENTTARGET", "__EVENTARGUMENT", "__LASTFOCUS"}
+        ]
 
-    # Add our intended selections
-    for v in class_values:
-        post_items.append((class_select_name, v))
-    post_items.append((county_select_name, county_value))
+        # Add our selections
+        if use_text_fallback:
+            # Fallback attempt: post visible text (sometimes WebForms validators behave oddly with numeric values)
+            for c in TARGET_CLASSIFICATIONS:
+                post_items.append((class_select_name, c))
+            post_items.append((county_select_name, county_text))
+        else:
+            for v in class_values:
+                post_items.append((class_select_name, v))
+            post_items.append((county_select_name, str(county_value)))
 
-    # Add the "Download" button field
-    post_items.append((submit_name, submit_value))
+        # Add button field (some servers check it)
+        post_items.append((submit_name, submit_value))
 
-    # Force proper WebForms postback fields
-    # If onclick gave us a target, use it; otherwise fall back to submit_name
-    post_items.append(("__EVENTTARGET", pb_target or submit_name))
-    post_items.append(("__EVENTARGUMENT", pb_arg or ""))
+        # WebForms postback plumbing
+        post_items.append(("__EVENTTARGET", pb_target or submit_name))
+        post_items.append(("__EVENTARGUMENT", pb_arg or ""))
+        post_items.append(("__LASTFOCUS", ""))
 
-    # Step 1: POST (this is the missing piece in your current file)
-    r1 = session.post(
-        CSLB_LIST_BY_COUNTY_URL,
-        data=post_items,
-        timeout=timeout,
-        headers={"Referer": CSLB_LIST_BY_COUNTY_URL},
-    )
-    r1.raise_for_status()
+        r = session.post(
+            CSLB_LIST_BY_COUNTY_URL,
+            data=post_items,
+            timeout=timeout,
+            headers={"Referer": CSLB_LIST_BY_COUNTY_URL},
+        )
+        r.raise_for_status()
+        return r
+
+    # Attempt 1: value-based post
+    r1 = do_post(use_text_fallback=False)
 
     print("[POST] status=", r1.status_code)
     print("[POST] content-type=", r1.headers.get("Content-Type"))
     print("[POST] content-disposition=", r1.headers.get("Content-Disposition"))
     print("[POST] first_bytes=", r1.content[:16])
 
-    # If the POST returned Excel, we're done
     if _is_excel_response(r1):
         return r1.content, None
 
-    # Otherwise HTML: debug and check for validation messaging
     debug_dump_html("POST page", r1.text)
 
     low = (r1.text or "").lower()
-    print("[POST] has_validation_text=",
-          ("please select" in low) or ("required" in low) or ("validation" in low) or ("error" in low))
+    has_validation = ("please select" in low) or ("required" in low) or ("validation" in low) or ("error" in low)
+    print("[POST] has_validation_text=", has_validation)
+    _print_selected_state("POST page", r1.text, class_select_name, county_select_name)
+
+    if has_validation:
+        snippet = _extract_validation_snippet(r1.text)
+        if snippet:
+            print("[POST] validation_snippet=", snippet[:400])
+
+        # Attempt 2 (fallback): text-based post
+        print("[POST] retrying with TEXT values for selections...")
+        r1b = do_post(use_text_fallback=True)
+
+        print("[POST retry] status=", r1b.status_code)
+        print("[POST retry] content-type=", r1b.headers.get("Content-Type"))
+        print("[POST retry] content-disposition=", r1b.headers.get("Content-Disposition"))
+        print("[POST retry] first_bytes=", r1b.content[:16])
+
+        if _is_excel_response(r1b):
+            return r1b.content, None
+
+        debug_dump_html("POST retry page", r1b.text)
+        lowb = (r1b.text or "").lower()
+        has_validation_b = ("please select" in lowb) or ("required" in lowb) or ("validation" in lowb) or ("error" in lowb)
+        print("[POST retry] has_validation_text=", has_validation_b)
+        _print_selected_state("POST retry page", r1b.text, class_select_name, county_select_name)
+
+        # If retry still fails, return HTML so caller can exit cleanly (and logs will show why)
+        return None, r1b.content
 
     if is_maintenance_or_no_data_page(r1.text):
         return None, None
 
-    # Some flows expose a direct download link after POST
+    # Direct download link check (rare here, but keep)
     direct = _find_direct_download_link(r1.text)
     if direct:
         r_dl = session.get(direct, timeout=timeout, headers={"Referer": CSLB_LIST_BY_COUNTY_URL})
@@ -439,7 +514,6 @@ def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tu
         if _looks_like_html(r_dl.content):
             return None, r_dl.content
 
-    # No excel found; return HTML for table parsing (unlikely on this page)
     return None, r1.content
 
 
