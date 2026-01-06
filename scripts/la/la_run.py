@@ -3,16 +3,14 @@ import io
 import json
 import time
 import hashlib
+import csv
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import gspread
 from google.oauth2.service_account import Credentials
 
-import openpyxl  # .xlsx
-import xlrd      # .xls (BIFF)
-
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
 
 # =============================
@@ -21,19 +19,36 @@ from playwright.sync_api import sync_playwright
 
 CEQANET_URL = "https://ceqanet.lci.ca.gov/"
 
-# Search window = all of 2026
-DATE_START = "01/01/2026"
-DATE_END   = "12/31/2026"
+# CEQAnet UI in your screenshots expects dd.mm.yyyy (with dots)
+DATE_START = os.environ.get("LA_CEQANET_DATE_START", "01.01.2026")
+DATE_END   = os.environ.get("LA_CEQANET_DATE_END",   "31.12.2026")
 
-# Reuse your existing LA env vars (so you don't need new secrets)
+# Google Sheet (reuse your existing env vars)
 SHEET_ID = os.environ.get("LA_SHEET_ID")
 TAB_NAME = os.environ.get("LA_TAB_NAME")
 CREDS_ENV = "LA_GOOGLE_CREDENTIALS_JSON"
 
 # Controls
-MAX_NEW = int(os.environ.get("LA_MAX_NEW", "2000"))
-SLEEP_SECONDS = float(os.environ.get("LA_SLEEP_SECONDS", "0.05"))
+MAX_NEW = int(os.environ.get("LA_MAX_NEW", "500"))
+SLEEP_SECONDS = float(os.environ.get("LA_SLEEP_SECONDS", "0.10"))
 
+# Detail scraping controls (this is what gets you “real” non-government contacts)
+ENRICH_DETAILS = os.environ.get("LA_ENRICH_DETAILS", "true").lower() == "true"
+DETAIL_CAP = int(os.environ.get("LA_DETAIL_CAP", "150"))  # scraping details is slower
+
+# Only keep contacts likely to be “private side” (what you want)
+# (You can expand later.)
+PREFERRED_CONTACT_TYPES = {
+    "Project Applicant",
+    "Consulting Firm",
+    "Applicant",
+    "Consultant",
+    "Developer",
+    "Owner",
+    "Engineer",
+    "Architect",
+    "Contractor",
+}
 
 # =============================
 # Helpers
@@ -73,70 +88,6 @@ def load_existing_ids(ws, id_col: int = 1) -> set:
     return {v.strip() for v in col_values[1:] if v and v.strip()}
 
 
-def _looks_like_xlsx(b: bytes) -> bool:
-    return len(b) >= 2 and b[0:2] == b"PK"
-
-
-def _looks_like_xls(b: bytes) -> bool:
-    return len(b) >= 8 and b[0:8] == bytes([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])
-
-
-def parse_excel_xlsx(x: bytes) -> List[Dict[str, str]]:
-    wb = openpyxl.load_workbook(io.BytesIO(x), read_only=True, data_only=True)
-    ws = wb.worksheets[0]
-    rows_iter = ws.iter_rows(values_only=True)
-
-    headers: List[str] = []
-    out: List[Dict[str, str]] = []
-    for idx, row in enumerate(rows_iter):
-        values = [normalize_str(v) for v in row]
-        if idx == 0:
-            headers = values
-            continue
-        if not any(values):
-            continue
-        if len(values) < len(headers):
-            values += [""] * (len(headers) - len(values))
-        out.append({headers[i]: values[i] for i in range(min(len(headers), len(values)))})
-    return out
-
-
-def parse_excel_xls(x: bytes) -> List[Dict[str, str]]:
-    book = xlrd.open_workbook(file_contents=x)
-    sheet = book.sheet_by_index(0)
-
-    if sheet.nrows < 1:
-        return []
-
-    headers = [normalize_str(sheet.cell_value(0, c)) for c in range(sheet.ncols)]
-    out: List[Dict[str, str]] = []
-    for r in range(1, sheet.nrows):
-        rowvals = [normalize_str(sheet.cell_value(r, c)) for c in range(sheet.ncols)]
-        if not any(rowvals):
-            continue
-        if len(rowvals) < len(headers):
-            rowvals += [""] * (len(headers) - len(rowvals))
-        out.append({headers[i]: rowvals[i] for i in range(min(len(headers), len(rowvals)))})
-    return out
-
-
-def parse_download_bytes(download_bytes: bytes) -> List[Dict[str, str]]:
-    # Excel formats
-    if _looks_like_xlsx(download_bytes):
-        return parse_excel_xlsx(download_bytes)
-    if _looks_like_xls(download_bytes):
-        return parse_excel_xls(download_bytes)
-
-    # CSV fallback
-    text = download_bytes.decode("utf-8", errors="ignore").strip()
-    if "," in text and "\n" in text:
-        import csv
-        rows = list(csv.DictReader(io.StringIO(text)))
-        return [{k: normalize_str(v) for k, v in r.items()} for r in rows]
-
-    return []
-
-
 def pick(row: Dict[str, str], candidates: List[str]) -> str:
     lower_map = {k.lower(): k for k in row.keys()}
     for c in candidates:
@@ -148,13 +99,66 @@ def pick(row: Dict[str, str], candidates: List[str]) -> str:
     return ""
 
 
+def parse_csv_bytes(download_bytes: bytes) -> List[Dict[str, str]]:
+    text = download_bytes.decode("utf-8", errors="ignore")
+    text = text.lstrip("\ufeff")  # strip BOM if present
+    reader = csv.DictReader(io.StringIO(text))
+    out: List[Dict[str, str]] = []
+    for r in reader:
+        out.append({normalize_str(k): normalize_str(v) for k, v in (r or {}).items()})
+    return out
+
+
+def stable_award_id(sch: str, title: str, lead: str, received: str, county: str, city: str) -> str:
+    key = sch or f"{title}|{lead}|{received}|{county}|{city}"
+    return hashlib.md5(key.encode("utf-8")).hexdigest()
+
+
+def looks_like_construction_project(title: str, desc: str, dev_type: str) -> bool:
+    """
+    You said “ALL construction of any type”. CEQAnet is already project-level.
+    We keep everything and optionally flag likely construction-related by keywords.
+    """
+    blob = f"{title} {desc} {dev_type}".lower()
+    keywords = [
+        "construction", "build", "building", "renov", "remodel", "tenant improvement",
+        "addition", "expansion", "demolition", "grading", "excavation", "bridge",
+        "road", "highway", "pipeline", "facility", "warehouse", "hotel", "apartment",
+        "housing", "subdivision", "plant", "solar", "wind", "station", "infrastructure",
+        "industrial", "commercial", "residential", "transportation"
+    ]
+    return any(k in blob for k in keywords)
+
+
 # =============================
 # CEQAnet automation (Playwright)
 # =============================
 
-def ceqanet_download_statewide_2026(timeout_ms: int = 120_000) -> bytes:
+def _click_first(page, selectors: List[str], timeout_ms: int = 10_000) -> bool:
+    for sel in selectors:
+        try:
+            page.locator(sel).first.click(timeout=timeout_ms)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _fill_date_field(page, label_candidates: List[str], value: str) -> bool:
+    # Try label-based
+    for lab in label_candidates:
+        try:
+            page.get_by_label(lab, exact=False).fill(value, timeout=5_000)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def ceqanet_download_csv_for_2026(timeout_ms: int = 150_000) -> Tuple[bytes, str]:
     """
-    Drives CEQAnet Advanced Search and downloads results for statewide California for 2026 date range.
+    Runs Advanced Search for the date range and downloads the CSV.
+    Returns (csv_bytes, results_page_url).
     """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -164,107 +168,240 @@ def ceqanet_download_statewide_2026(timeout_ms: int = 120_000) -> bytes:
         page.goto(CEQANET_URL, wait_until="domcontentloaded", timeout=timeout_ms)
 
         # Go to Advanced Search
-        advanced_selectors = [
+        ok_adv = _click_first(page, [
             "text=Advanced Search",
             "a:has-text('Advanced Search')",
             "button:has-text('Advanced Search')",
             "text=Advanced",
-        ]
-        for sel in advanced_selectors:
-            try:
-                page.locator(sel).first.click(timeout=10_000)
-                break
-            except Exception:
-                continue
+        ])
+        if not ok_adv:
+            page.screenshot(path="ceqanet_debug_no_advanced.png", full_page=True)
+            raise RuntimeError("Could not open Advanced Search. Saved ceqanet_debug_no_advanced.png")
 
         page.wait_for_timeout(800)
 
-        # Fill date range. Labels differ across versions; use multiple fallbacks.
-        def try_fill_by_label(label_frag: str, value: str) -> bool:
-            try:
-                page.get_by_label(label_frag, exact=False).fill(value, timeout=5_000)
-                return True
-            except Exception:
-                return False
+        # Fill Start Range / End Range (dd.mm.yyyy in your screenshots)
+        ok_start = _fill_date_field(page, ["Start Range", "Start", "From", "Begin"], DATE_START)
+        ok_end   = _fill_date_field(page, ["End Range", "End", "To"], DATE_END)
 
-        # Best-effort: fill 2 date fields
-        ok1 = (
-            try_fill_by_label("Start", DATE_START) or
-            try_fill_by_label("From", DATE_START) or
-            try_fill_by_label("Begin", DATE_START)
-        )
-        ok2 = (
-            try_fill_by_label("End", DATE_END) or
-            try_fill_by_label("To", DATE_END)
-        )
-
-        # If label matching fails, fill the first two visible text inputs that look empty.
-        if not (ok1 and ok2):
+        # Fallback: fill first two visible text inputs
+        if not (ok_start and ok_end):
             inputs = page.locator("input[type='text']:visible")
-            count = inputs.count()
-            if count >= 2:
+            if inputs.count() >= 2:
                 inputs.nth(0).fill(DATE_START)
                 inputs.nth(1).fill(DATE_END)
 
-        # Ensure statewide by clearing County/City if present
-        for label in ["County", "City"]:
-            try:
-                dd = page.get_by_label(label, exact=False)
-                dd.select_option("")  # clear
-            except Exception:
-                pass
+        # Ensure statewide: leave County/City as (Any) if possible
+        # We do NOT force a specific county.
+        # (If you later want per-county runs, do it via env var.)
+        # No action required unless a value is already selected by browser state.
 
-        # Click Search
-        search_selectors = [
+        # Click "Get Results" (THIS is the key difference from your broken version)
+        clicked = _click_first(page, [
+            "button:has-text('Get Results')",
+            "input[value='Get Results']",
+            "text=Get Results",
+        ])
+        if not clicked:
+            page.screenshot(path="ceqanet_debug_no_get_results.png", full_page=True)
+            raise RuntimeError("Could not click Get Results. Saved ceqanet_debug_no_get_results.png")
+
+        # Wait for results page content
+        try:
+            page.wait_for_selector("text=Search Results", timeout=40_000)
+        except PWTimeoutError:
+            # Still might be results without that heading; continue
+            pass
+
+        page.wait_for_timeout(1000)
+
+        # Download CSV
+        download = None
+        try:
+            with page.expect_download(timeout=60_000) as dl_info:
+                ok_dl = _click_first(page, [
+                    "text=Download CSV",
+                    "button:has-text('Download CSV')",
+                    "a:has-text('Download CSV')",
+                ], timeout_ms=10_000)
+                if not ok_dl:
+                    page.screenshot(path="ceqanet_debug_no_download_csv.png", full_page=True)
+                    raise RuntimeError("Results loaded, but could not find Download CSV button.")
+            download = dl_info.value
+        except Exception as e:
+            page.screenshot(path="ceqanet_debug_download_failed.png", full_page=True)
+            raise RuntimeError(f"CSV download failed. Saved ceqanet_debug_download_failed.png. Error={e}")
+
+        csv_bytes = download.path().read_bytes()  # type: ignore
+        results_url = page.url
+
+        browser.close()
+        return csv_bytes, results_url
+
+
+def ceqanet_scrape_contacts_from_sch(timeout_ms: int, sch_number: str) -> List[Dict[str, str]]:
+    """
+    Scrapes non-government-ish contacts from the SCH detail page by:
+      - running an SCH search on the site (Find by SCH Number)
+      - opening the detail page
+      - extracting Contact Information section text and parsing into structured fields
+    """
+    contacts: List[Dict[str, str]] = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+
+        page.goto(CEQANET_URL, wait_until="domcontentloaded", timeout=timeout_ms)
+
+        # Use global search / direct SCH finder workflow
+        # We try several paths because CEQAnet navigation changes.
+        _click_first(page, [
+            "text=Search",
+            "a:has-text('Search')",
+            "text=Advanced Search",
+        ])
+
+        page.wait_for_timeout(500)
+
+        # Many CEQAnet pages have "Find by SCH Number" button on search page
+        ok_find = _click_first(page, [
+            "text=Find by SCH Number",
+            "button:has-text('Find by SCH Number')",
+            "a:has-text('Find by SCH Number')",
+        ], timeout_ms=5_000)
+
+        if ok_find:
+            page.wait_for_timeout(600)
+
+        # Try to locate an SCH input box
+        sch_filled = False
+        for sel in [
+            "input[aria-label*='SCH' i]",
+            "input[name*='SCH' i]",
+            "input[id*='SCH' i]",
+            "input[type='text']:visible",
+        ]:
+            try:
+                loc = page.locator(sel).first
+                loc.fill(sch_number, timeout=5_000)
+                sch_filled = True
+                break
+            except Exception:
+                continue
+
+        if not sch_filled:
+            browser.close()
+            return contacts
+
+        # Submit / search
+        clicked = _click_first(page, [
             "button:has-text('Search')",
+            "button:has-text('Get Results')",
             "input[value='Search']",
             "text=Search",
-        ]
-        clicked = False
-        for sel in search_selectors:
-            try:
-                page.locator(sel).first.click(timeout=10_000)
-                clicked = True
-                break
-            except Exception:
-                continue
+        ], timeout_ms=8_000)
         if not clicked:
-            page.screenshot(path="ceqanet_debug_search_click.png", full_page=True)
-            raise RuntimeError("Could not click Search in CEQAnet Advanced Search. Saved ceqanet_debug_search_click.png")
+            browser.close()
+            return contacts
 
-        # Wait for results to render
-        page.wait_for_timeout(2000)
+        # Click SCH number in results
+        try:
+            page.wait_for_timeout(1200)
+            page.locator(f"text={sch_number}").first.click(timeout=10_000)
+        except Exception:
+            browser.close()
+            return contacts
 
-        # Click Export/Download
-        download_selectors = [
-            "button:has-text('Export')",
-            "button:has-text('Download')",
-            "a:has-text('Export')",
-            "a:has-text('Download')",
-            "text=Excel",
-            "text=CSV",
-        ]
+        page.wait_for_timeout(1200)
 
-        download = None
-        for sel in download_selectors:
-            try:
-                with page.expect_download(timeout=30_000) as dl_info:
-                    page.locator(sel).first.click(timeout=10_000)
-                download = dl_info.value
-                break
-            except Exception:
-                continue
+        # Extract text between "Contact Information" and "Location"
+        body_text = page.locator("body").inner_text(timeout=10_000)
 
-        if download is None:
-            page.screenshot(path="ceqanet_debug_no_export.png", full_page=True)
-            html = page.content()
-            print("[CEQANET] No export/download control found. Saved ceqanet_debug_no_export.png")
-            print("[CEQANET] Page content length:", len(html))
-            raise RuntimeError("CEQAnet search ran, but export/download control was not found.")
+        start_idx = body_text.lower().find("contact information")
+        if start_idx == -1:
+            browser.close()
+            return contacts
 
-        data = download.path().read_bytes()  # type: ignore
+        tail = body_text[start_idx:]
+        end_idx = tail.lower().find("\nlocation")
+        if end_idx != -1:
+            section = tail[:end_idx]
+        else:
+            section = tail
+
+        # Parse into contacts by scanning label/value pairs
+        labels = {
+            "name",
+            "agency name",
+            "job title",
+            "contact types",
+            "address",
+            "phone",
+            "email",
+        }
+
+        lines = [ln.strip() for ln in section.splitlines() if ln.strip()]
+        current: Dict[str, str] = {}
+
+        def flush():
+            nonlocal current
+            if current:
+                contacts.append(current)
+                current = {}
+
+        i = 0
+        while i < len(lines):
+            key = lines[i].strip().lower()
+            if key in labels:
+                # new contact detection: if we see "Name" again and current already has a name, flush
+                if key == "name" and current.get("name"):
+                    flush()
+
+                # value = next non-label line
+                j = i + 1
+                val = ""
+                while j < len(lines):
+                    nxt = lines[j].strip()
+                    if nxt.lower() in labels:
+                        break
+                    val = nxt
+                    break
+                if val:
+                    current[key] = val
+                i = j
+            else:
+                i += 1
+
+        flush()
+
         browser.close()
-        return data
+
+    # Normalize keys
+    normed: List[Dict[str, str]] = []
+    for c in contacts:
+        normed.append({
+            "name": c.get("name", ""),
+            "agency_name": c.get("agency name", ""),
+            "job_title": c.get("job title", ""),
+            "contact_types": c.get("contact types", ""),
+            "address": c.get("address", ""),
+            "phone": c.get("phone", ""),
+            "email": c.get("email", ""),
+        })
+
+    # Prefer non-government-ish contacts
+    filtered: List[Dict[str, str]] = []
+    for c in normed:
+        ctype = (c.get("contact_types") or "").strip()
+        # Skip lead/public agency employees unless there is no alternative
+        if ctype.lower() in {"lead/public agency", "lead public agency"}:
+            continue
+        filtered.append(c)
+
+    # If filtering removed everything, return raw normed
+    return filtered or normed
 
 
 # =============================
@@ -282,9 +419,9 @@ def main():
     hmap = header_map(ws)
     existing_ids = load_existing_ids(ws, id_col=1)
 
-    print("CEQAnet statewide (California) | pulling records with date range in 2026...")
-    download_bytes = ceqanet_download_statewide_2026()
-    rows = parse_download_bytes(download_bytes)
+    print(f"CEQAnet (California) | pulling records for date range {DATE_START} → {DATE_END} ...")
+    csv_bytes, results_url = ceqanet_download_csv_for_2026()
+    rows = parse_csv_bytes(csv_bytes)
 
     print(f"Downloaded + parsed rows: {len(rows)}")
     if not rows:
@@ -294,63 +431,110 @@ def main():
     now = utc_now_str()
     rows_to_append: List[List[str]] = []
     appended = 0
+    detail_used = 0
 
     for r in rows:
         if appended >= MAX_NEW:
             break
 
-        # Typical CEQAnet columns (varies by export)
-        sch = pick(r, ["SCH Number", "SCH#", "SCH", "State Clearinghouse Number"])
-        title = pick(r, ["Project Title", "Title", "Project"])
-        lead = pick(r, ["Lead Agency", "Agency"])
+        # Common CEQAnet CSV columns seen on results page exports:
+        sch = pick(r, ["SCH Number", "SCH", "SCH#", "State Clearinghouse Number"])
+        title = pick(r, ["Title", "Project Title", "Project"])
+        lead = pick(r, ["Lead/Public Agency", "Lead Agency", "Agency"])
+        received = pick(r, ["Received", "Received Date", "Date Received"])
+        doc_type = pick(r, ["Type", "Document Type", "Doc Type"])
         county = pick(r, ["County"])
         city = pick(r, ["City"])
-        doc_type = pick(r, ["Document Type", "Doc Type", "Type"])
-        received = pick(r, ["Received", "Received Date", "Date Received"])
-        posted = pick(r, ["Posted", "Posted Date", "Date Posted", "Published", "Publication Date"])
+        dev_type = pick(r, ["Development Type", "Dev Type", "Development"])
+        # Some exports include “Location”, others do not.
         location = pick(r, ["Location", "Project Location", "Address"])
-        desc = pick(r, ["Description", "Project Description"])
 
-        stable_key = sch or f"{title}|{lead}|{posted}|{received}|{county}|{city}"
-        award_id = hashlib.md5(stable_key.encode("utf-8")).hexdigest()
+        award_id = stable_award_id(
+            sch=sch,
+            title=title,
+            lead=lead,
+            received=received,
+            county=county,
+            city=city,
+        )
 
         if award_id in existing_ids:
             continue
 
-        # Map into your existing sheet schema (best-effort)
+        # Optional detail scrape for Applicant/Consulting Firm contacts
+        contacts: List[Dict[str, str]] = []
+        if ENRICH_DETAILS and sch and detail_used < DETAIL_CAP:
+            try:
+                contacts = ceqanet_scrape_contacts_from_sch(timeout_ms=150_000, sch_number=sch)
+                detail_used += 1
+            except Exception as e:
+                print(f"[DETAIL] Failed for SCH={sch}: {e}")
+
+        # Choose a “best” private-side contact
+        chosen = None
+        if contacts:
+            # Prefer a contact whose Contact Types matches our preferred set
+            for c in contacts:
+                ctype = (c.get("contact_types") or "").strip()
+                if ctype in PREFERRED_CONTACT_TYPES:
+                    chosen = c
+                    break
+            # fallback: first contact
+            if not chosen:
+                chosen = contacts[0]
+
+        # For your sheet schema: “Recipient (Company)” should be a real org to contact.
+        # Best proxy from CEQAnet is usually Applicant or Consulting Firm agency name.
+        recipient_company = ""
+        if chosen:
+            recipient_company = chosen.get("agency_name", "")
+
+        # Also keep a flag for likely construction; you said “all”, but this helps later segmentation.
+        is_constructionish = looks_like_construction_project(title=title, desc="", dev_type=dev_type)
+
+        # Put SCH detail page into “Award Link” as your primary reference (best we can do reliably)
+        # We do not have a stable URL pattern here without live probing, so we store the results URL + SCH.
+        award_link = f"{results_url} (SCH={sch})" if results_url else f"SCH={sch}"
+
+        # Pack all contacts into notes (so you can parse later if needed)
+        contacts_json = json.dumps(contacts, ensure_ascii=False)
+
         values = {
             "Award ID": award_id,
-            "Recipient (Company)": "",  # CEQAnet is project-level, not contractor-level
-            "Recipient (HQ) Address": location,
-            "Start Date": "2026-01-01",  # marker for your “2026 pipeline”
+            "Recipient (Company)": recipient_company,
+            "Recipient UEI": "",
+            "Parent Recipient UEI": "",
+            "Parent Recipient DUNS": "",
+            "Recipient (HQ) Address": location or (chosen.get("address", "") if chosen else ""),
+            "Start Date": "2026-01-01",  # marker for your 2026 pipeline
             "End Date": "",
             "Last Modified Date": now,
             "Award Amount (Obligated)": "",
-            "NAICS Code": "",
-            "NAICS Description": "",
+            "NAICS Code": "",              # CEQAnet does not provide NAICS
+            "NAICS Description": "",       # CEQAnet does not provide NAICS
             "Awarding Agency": lead,
             "Place of Performance": ", ".join([x for x in [city, county, "CA"] if x]),
-            "Description": f"{title} | {doc_type} | Posted={posted} | Received={received} | {desc}".strip(),
-            "Award Link": "",
+            "Description": f"{title} | {doc_type} | DevType={dev_type} | Received={received}".strip(),
+            "Award Link": award_link,
             "Recipient Profile Link": "",
             "Web Search Link": "",
 
             "Company Website": "",
-            "Company Phone": "",
-            "Company General Email": "",
-            "Responsible Person Name": "",
-            "Responsible Person Role": "",
-            "Responsible Person Email": "",
-            "Responsible Person Phone": "",
+            "Company Phone": (chosen.get("phone", "") if chosen else ""),
+            "Company General Email": (chosen.get("email", "") if chosen else ""),
+            "Responsible Person Name": (chosen.get("name", "") if chosen else ""),
+            "Responsible Person Role": (chosen.get("job_title", "") if chosen else ""),
+            "Responsible Person Email": (chosen.get("email", "") if chosen else ""),
+            "Responsible Person Phone": (chosen.get("phone", "") if chosen else ""),
 
-            "confidence_score": "60",
-            "prediction_rationale": "ceqanet_statewide_advanced_search(+60)",
+            "confidence_score": "65" if contacts else "55",
+            "prediction_rationale": "ceqanet_search(+55); detail_contacts(+10)" if contacts else "ceqanet_search(+55)",
             "target_flag": "TRUE",
             "recipient_id": award_id,
             "data_source": "CEQAnet (CA State Clearinghouse)",
             "data_confidence_level": "Medium",
             "last_verified_date": now,
-            "notes": f"SCH={sch}; DocType={doc_type}; Lead={lead}",
+            "notes": f"SCH={sch}; County={county}; City={city}; construction_hint={is_constructionish}; contacts={contacts_json}",
         }
 
         ordered = [""] * len(hmap)
@@ -368,6 +552,7 @@ def main():
     else:
         print("No new rows appended (deduped or empty export).")
 
+    print(f"Detail pages scraped: {detail_used} (cap={DETAIL_CAP})")
     print("Done.")
 
 
