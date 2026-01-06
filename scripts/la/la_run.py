@@ -294,9 +294,6 @@ def _find_export_postback_target(html: str) -> Optional[Tuple[str, str]]:
     # fallback: return the first
     return candidates[0]
 
-
-
-    return None
 def debug_dump_html(label: str, html: str) -> None:
     """
     Copy/paste over your existing debug_dump_html().
@@ -418,19 +415,19 @@ def download_or_results_html(session: requests.Session, timeout: int = 60) -> Tu
     post_items.append((county_select_name, TARGET_COUNTY))
 
     if submit:
-    submit_name, submit_value = submit
+        submit_name, submit_value = submit
 
-    # Always include the button name/value (harmless even if not required)
-    post_items.append((submit_name, submit_value))
+        # Always include the button name/value (harmless even if not required)
+        post_items.append((submit_name, submit_value))
 
-    # If CSLB renders it as type="button", we must simulate the JS postback
-    submit_type = _input_type_by_name(soup0, submit_name)
-    if submit_type == "button":
-        post_items.append(("__EVENTTARGET", submit_name))   # WebForms UniqueID uses $
-        post_items.append(("__EVENTARGUMENT", ""))
+        # If CSLB renders it as type="button", we must simulate the JS postback
+        submit_type = _input_type_by_name(soup0, submit_name)
+        if submit_type == "button":
+            post_items.append(("__EVENTTARGET", submit_name))   # WebForms UniqueID uses $
+            post_items.append(("__EVENTARGUMENT", ""))
     else:
-    post_items.append(("__EVENTTARGET", ""))
-    post_items.append(("__EVENTARGUMENT", ""))
+        post_items.append(("__EVENTTARGET", ""))
+        post_items.append(("__EVENTARGUMENT", ""))
 
 
     r1 = session.post(
