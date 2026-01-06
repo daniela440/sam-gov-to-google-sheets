@@ -247,6 +247,12 @@ def _find_excel_postback_target(html: str) -> Optional[Tuple[str, str]]:
 
     return None
 def debug_dump_html(label: str, html: str) -> None:
+    """
+    Debug helper to print page structure + ALWAYS show snippets near:
+    __doPostBack, download, export, excel (no early break).
+
+    Copy/paste this function over your existing debug_dump_html().
+    """
     try:
         soup = BeautifulSoup(html or "", "lxml")
         title = soup.title.get_text(" ", strip=True) if soup.title else ""
@@ -264,8 +270,12 @@ def debug_dump_html(label: str, html: str) -> None:
 
         buttons = []
         for b in soup.find_all("button"):
-            buttons.append((normalize_str(b.get("name")),
-                            normalize_str(b.get("value")) or normalize_str(b.get_text(" ", strip=True))))
+            buttons.append(
+                (
+                    normalize_str(b.get("name")),
+                    normalize_str(b.get("value")) or normalize_str(b.get_text(" ", strip=True)),
+                )
+            )
 
         print("---- CSLB DEBUG ----")
         print(f"[{label}] title={title!r}")
@@ -286,18 +296,34 @@ def debug_dump_html(label: str, html: str) -> None:
         print(f"[{label}] buttons={buttons[:10]}")
 
         lowered = (html or "").lower()
-        for kw in ["no records", "no results", "validation", "error", "results", "download", "export", "excel", "__dopostback"]:
+
+        # 1) Print whether __doPostBack exists at all (quick signal)
+        print(f"[{label}] contains___doPostBack={('__dopostback' in lowered)}")
+
+        # 2) ALWAYS print snippets for these keywords if present (no early break)
+        for kw in ["__dopostback", "download", "export", "excel", ".xls", ".xlsx"]:
             idx = lowered.find(kw)
             if idx != -1:
-                start = max(0, idx - 120)
-                end = min(len(html), idx + 300)
-                snippet = re.sub(r"\s+", " ", (html[start:end]))
-                print(f"[{label}] snippet_near_{kw!r}: {snippet[:420]}")
-                break
+                start = max(0, idx - 200)
+                end = min(len(html), idx + 500)
+                snippet = re.sub(r"\s+", " ", html[start:end])
+                print(f"[{label}] snippet_near_{kw!r}: {snippet[:900]}")
+
+        # 3) Also print first few doPostBack calls found (very useful)
+        calls = re.findall(
+            r"__doPostBack\('([^']+)'\s*,\s*'([^']*)'\)",
+            html or "",
+            flags=re.IGNORECASE,
+        )
+        if calls:
+            print(f"[{label}] doPostBack_calls_found={len(calls)} sample={calls[:8]}")
+        else:
+            print(f"[{label}] doPostBack_calls_found=0")
 
         print("---- END CSLB DEBUG ----")
     except Exception as e:
         print(f"[{label}] debug_dump_html failed: {e}")
+
 
 
 
