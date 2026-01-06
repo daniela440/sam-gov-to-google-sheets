@@ -222,38 +222,43 @@ def _guess_class_and_county_select_names(soup: BeautifulSoup) -> Tuple[Optional[
 
 def _find_submit_button_name(soup: BeautifulSoup) -> Optional[Tuple[str, str]]:
     """
-    Returns (name, value) for a submit/button that likely triggers results.
-    """
+    Returns (name, value) for the action button that triggers download/results.
 
-    # Look for input submits
+    CSLB uses an ASP.NET WebForms button that may render as input[type=button] with value 'Download'.
+    """
+    # 1) Look for the explicit Download button first
     for inp in soup.find_all("input"):
-        if normalize_str(inp.get("type")).lower() != "submit":
+        t = normalize_str(inp.get("type")).lower()
+        name = normalize_str(inp.get("name"))
+        value = normalize_str(inp.get("value"))
+        if not name:
+            continue
+        if t in ("submit", "button", "image") and value.lower() in ("download", "search"):
+            return name, (value or "Download")
+
+    # 2) Heuristic fallback: any input that looks like an action
+    for inp in soup.find_all("input"):
+        t = normalize_str(inp.get("type")).lower()
+        if t not in ("submit", "button", "image"):
             continue
         name = normalize_str(inp.get("name"))
         value = normalize_str(inp.get("value"))
         blob = f"{name} {value}".lower()
-        if any(k in blob for k in ["search", "view", "results", "submit", "filter", "run", "show", "go"]):
+        if any(k in blob for k in ["download", "search", "view", "results", "submit", "filter", "run", "show", "go"]):
             if name:
-                return name, (value or "Search")
+                return name, (value or "Download")
 
-    # Look for <button> elements
+    # 3) <button> elements (rare on this page, but keep)
     for btn in soup.find_all("button"):
         name = normalize_str(btn.get("name"))
         value = normalize_str(btn.get("value")) or normalize_str(btn.get_text(" ", strip=True))
         blob = f"{name} {value}".lower()
-        if any(k in blob for k in ["search", "view", "results", "submit", "filter", "run", "show", "go"]):
+        if any(k in blob for k in ["download", "search", "view", "results", "submit", "filter", "run", "show", "go"]):
             if name:
-                return name, (value or "Search")
-
-    # Fallback: any submit input
-    for inp in soup.find_all("input"):
-        if normalize_str(inp.get("type")).lower() == "submit":
-            name = normalize_str(inp.get("name"))
-            value = normalize_str(inp.get("value"))
-            if name:
-                return name, (value or "Search")
+                return name, (value or "Download")
 
     return None
+
 
 
 def _find_export_postback_target(html: str) -> Optional[Tuple[str, str]]:
