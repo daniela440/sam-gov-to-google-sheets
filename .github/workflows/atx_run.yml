@@ -1,4 +1,4 @@
-name: CA - Pull CEQAnet 2026 Filings into Google Sheet
+name: ATX - Pull Issued Construction Permits into Google Sheet
 
 on:
   workflow_dispatch:
