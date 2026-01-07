@@ -38,3 +38,12 @@ jobs:
           LA_SLEEP_SECONDS: "0.05"
         run: |
           python scripts/la/la_run.py
+
+      - name: Upload CEQAnet debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ceqanet-debug
+          path: |
+            **/ceqanet_debug_*.png
+            **/ceqanet_debug_*.html
