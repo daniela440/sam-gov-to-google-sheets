@@ -11,7 +11,6 @@ import gspread
 from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-
 # =============================
 # CONFIG
 # =============================
@@ -20,7 +19,7 @@ CEQANET_URL = "https://ceqanet.lci.ca.gov/"
 
 # CEQAnet date format in UI: dd.mm.yyyy
 DATE_START = os.environ.get("LA_CEQANET_DATE_START", "15.12.2025")
-DATE_END   = os.environ.get("LA_CEQANET_DATE_END",   "31.12.2026")
+DATE_END = os.environ.get("LA_CEQANET_DATE_END", "31.12.2026")
 
 # Document types you requested
 DOC_TYPES = ["NOP", "NOE"]
@@ -111,7 +110,6 @@ def parse_csv_bytes(download_bytes: bytes) -> List[Dict[str, str]]:
 
 
 def stable_award_id(ceqa_id: str, sch: str, title: str, doc_type: str, received: str) -> str:
-    # Prefer CEQA ID if present (e.g., 2026010057)
     key = ceqa_id or sch or f"{title}|{doc_type}|{received}"
     return hashlib.md5(key.encode("utf-8")).hexdigest()
 
@@ -130,18 +128,11 @@ def looks_like_construction_project(title: str, desc: str, dev_type: str) -> boo
 
 
 def ceqa_detail_url_from_row(row: Dict[str, str]) -> str:
-    """
-    Try to build a detail URL like https://ceqanet.lci.ca.gov/2026010057
-    based on whatever CEQAnet exports in CSV.
-    """
-    # Common possibilities in exports:
-    # - "CEQA #" or "CEQA Number" or "CEQAnet ID" or "Entry ID"
     ceqa_id = pick(row, ["CEQA #", "CEQA Number", "CEQAnet ID", "Entry ID", "CEQA ID", "ID"])
     ceqa_id = ceqa_id.replace("-", "").replace(" ", "")
     if ceqa_id.isdigit() and len(ceqa_id) == 10 and ceqa_id.startswith("20"):
         return f"{CEQANET_URL}{ceqa_id}"
 
-    # Some exports include direct URL
     url = pick(row, ["URL", "Link", "Detail Link", "Record Link"])
     if url.startswith("http"):
         return url
@@ -150,7 +141,34 @@ def ceqa_detail_url_from_row(row: Dict[str, str]) -> str:
 
 
 # =============================
-# Playwright: robust field helpers (match your screenshots)
+# Debug utilities
+# =============================
+
+def _dump_debug(page, prefix: str) -> None:
+    try:
+        print(f"[DEBUG] url={page.url}")
+    except Exception:
+        pass
+    try:
+        print(f"[DEBUG] title={page.title()}")
+    except Exception:
+        pass
+    try:
+        html = page.content()
+        with open(f"{prefix}.html", "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"[DEBUG] saved {prefix}.html")
+    except Exception as e:
+        print(f"[DEBUG] could not save html: {e}")
+    try:
+        page.screenshot(path=f"{prefix}.png", full_page=True)
+        print(f"[DEBUG] saved {prefix}.png")
+    except Exception as e:
+        print(f"[DEBUG] could not screenshot: {e}")
+
+
+# =============================
+# Playwright helpers
 # =============================
 
 def _click_first(page, selectors: List[str], timeout_ms: int = 10_000) -> bool:
@@ -165,94 +183,7 @@ def _click_first(page, selectors: List[str], timeout_ms: int = 10_000) -> bool:
     return False
 
 
-def _fill_input_by_row_text(page, row_text: str, value: str, timeout_ms: int = 10_000) -> bool:
-    """
-    Finds a row by its left-hand text (e.g., 'Start Range') and fills the first input to the right.
-    CEQAnet advanced search UI is typically a two-column layout.
-    """
-    xp = (
-        f"xpath=(//*[normalize-space()='{row_text}']"
-        f"/following::input[1])[1]"
-    )
-    try:
-        loc = page.locator(xp).first
-        loc.wait_for(state="visible", timeout=timeout_ms)
-        loc.fill(value, timeout=timeout_ms)
-        return True
-    except Exception:
-        return False
-
-
-def _select_by_row_text(page, row_text: str, option_text: str, timeout_ms: int = 10_000) -> bool:
-    """
-    Selects an option in the first <select> found to the right of the row label text.
-    """
-    xp = (
-        f"xpath=(//*[normalize-space()='{row_text}']"
-        f"/following::select[1])[1]"
-    )
-    try:
-        sel = page.locator(xp).first
-        sel.wait_for(state="visible", timeout=timeout_ms)
-        sel.select_option(label=option_text, timeout=timeout_ms)
-        return True
-    except Exception:
-        # fallback: try selecting by partial match via evaluating options
-        try:
-            sel = page.locator(xp).first
-            options = sel.locator("option")
-            cnt = options.count()
-            target_val = None
-            for i in range(cnt):
-                txt = normalize_str(options.nth(i).inner_text())
-                if option_text.lower() in txt.lower():
-                    target_val = options.nth(i).get_attribute("value")
-                    break
-            if target_val is not None:
-                sel.select_option(value=target_val)
-                return True
-        except Exception:
-            pass
-        return False
-
-
-def _open_advanced_search(page, timeout_ms: int = 60_000) -> None:
-    page.goto(CEQANET_URL, wait_until="domcontentloaded", timeout=timeout_ms)
-    page.wait_for_timeout(1200)
-
-    # Try clicking the top nav “Advanced Search” (shown in your screenshot)
-    clicked = False
-    try:
-        page.get_by_role("link", name="Advanced Search", exact=False).click(timeout=8_000, force=True)
-        clicked = True
-    except Exception:
-        pass
-
-    if not clicked:
-        clicked = _click_first(page, [
-            "a:has-text('Advanced Search')",
-            "a[href*='advanced' i]",
-            "text=Advanced Search",
-        ], timeout_ms=12_000)
-
-    if not clicked:
-        page.screenshot(path="ceqanet_debug_no_advanced.png", full_page=True)
-        raise RuntimeError("Could not open Advanced Search. Saved ceqanet_debug_no_advanced.png")
-
-    # Verify the form loaded (presence of Start Range / Get Results)
-    try:
-        page.wait_for_selector("text=Start Range", timeout=20_000)
-        page.wait_for_selector("text=Get Results", timeout=20_000)
-    except PWTimeoutError:
-        page.screenshot(path="ceqanet_debug_not_on_advanced.png", full_page=True)
-        raise RuntimeError("Not on Advanced Search form. Saved ceqanet_debug_not_on_advanced.png")
-
-
 def _dismiss_banners(page) -> None:
-    """
-    Best-effort click away cookie/consent banners that can block nav clicks in headless mode.
-    Safe to call repeatedly.
-    """
     candidates = [
         "button:has-text('Accept')",
         "button:has-text('I Accept')",
@@ -271,41 +202,64 @@ def _dismiss_banners(page) -> None:
             loc = page.locator(sel).first
             if loc.is_visible(timeout=800):
                 loc.click(timeout=1500, force=True)
-                page.wait_for_timeout(400)
+                page.wait_for_timeout(300)
         except Exception:
             pass
 
 
 def _is_on_advanced_form(page) -> bool:
-    """
-    Stronger check than "Get Results": confirm the form has the expected rows/controls.
-    """
     try:
-        # These are the exact row labels from your screenshot
         if page.locator("text=Start Range").first.is_visible(timeout=1200) and \
            page.locator("text=End Range").first.is_visible(timeout=1200) and \
            page.locator("text=Document Type").first.is_visible(timeout=1200):
             return True
     except Exception:
         pass
-
-    # Fallback: look for date placeholders shown in screenshot ("dd. mm. yyyy.")
     try:
         if page.locator("input[placeholder*='dd' i]").count() >= 2:
             return True
     except Exception:
         pass
-
     return False
 
 
+def _fill_input_by_row_text(page, row_text: str, value: str, timeout_ms: int = 10_000) -> bool:
+    xp = f"xpath=(//*[normalize-space()='{row_text}']/following::input[1])[1]"
+    try:
+        loc = page.locator(xp).first
+        loc.wait_for(state="visible", timeout=timeout_ms)
+        loc.fill(value, timeout=timeout_ms)
+        return True
+    except Exception:
+        return False
+
+
+def _select_by_row_text(page, row_text: str, option_text: str, timeout_ms: int = 10_000) -> bool:
+    xp = f"xpath=(//*[normalize-space()='{row_text}']/following::select[1])[1]"
+    try:
+        sel = page.locator(xp).first
+        sel.wait_for(state="visible", timeout=timeout_ms)
+        sel.select_option(label=option_text, timeout=timeout_ms)
+        return True
+    except Exception:
+        # fallback by partial match
+        try:
+            sel = page.locator(xp).first
+            options = sel.locator("option")
+            cnt = options.count()
+            for i in range(cnt):
+                txt = normalize_str(options.nth(i).inner_text())
+                if option_text.lower() in txt.lower():
+                    val = options.nth(i).get_attribute("value")
+                    if val:
+                        sel.select_option(value=val)
+                        return True
+        except Exception:
+            pass
+        return False
+
+
 def _open_advanced_search(page, timeout_ms: int = 60_000) -> None:
-    """
-    Robust navigation to Advanced Search:
-      1) Direct URL attempts (preferred)
-      2) /Search/Recent fallback
-      3) Click-based fallback using href contains AdvancedSearch
-    """
     advanced_url_candidates = [
         "https://ceqanet.lci.ca.gov/Search/AdvancedSearch",
         "https://ceqanet.lci.ca.gov/search/advancedsearch",
@@ -325,30 +279,27 @@ def _open_advanced_search(page, timeout_ms: int = 60_000) -> None:
         except Exception:
             return False
 
-    # 1) Try direct Advanced Search URLs
+    # 1) direct URL attempts
     for u in advanced_url_candidates:
         if goto_and_check(u):
             return
 
-    # 2) Fallback: go to Recent and try to navigate from there
+    # 2) fallback to Recent
     recent_url = "https://ceqanet.lci.ca.gov/Search/Recent"
     page.goto(recent_url, wait_until="domcontentloaded", timeout=timeout_ms)
     page.wait_for_timeout(1000)
     _dismiss_banners(page)
     page.wait_for_timeout(400)
 
-    # Sometimes the nav differs on /Search/Recent and exposes Advanced Search
-    # Try role-based first, then href-based.
     try:
         page.get_by_role("link", name="Advanced Search", exact=False).click(timeout=6_000, force=True)
-        page.wait_for_timeout(1000)
+        page.wait_for_timeout(800)
         _dismiss_banners(page)
         if _is_on_advanced_form(page):
             return
     except Exception:
         pass
 
-    # 3) Click by href contains "AdvancedSearch" (works even if link text differs)
     clicked = _click_first(page, [
         "a[href*='AdvancedSearch' i]",
         "a[href*='advancedsearch' i]",
@@ -358,18 +309,61 @@ def _open_advanced_search(page, timeout_ms: int = 60_000) -> None:
     ], timeout_ms=10_000)
 
     if clicked:
-        page.wait_for_timeout(1200)
+        page.wait_for_timeout(900)
         _dismiss_banners(page)
         if _is_on_advanced_form(page):
             return
 
-    # Final: attempt direct again after recent (sometimes session/cookies matter)
+    # final attempt
     for u in advanced_url_candidates:
         if goto_and_check(u):
             return
 
-    page.screenshot(path="ceqanet_debug_no_advanced.png", full_page=True)
-    raise RuntimeError("Could not open Advanced Search. Saved ceqanet_debug_no_advanced.png")
+    _dump_debug(page, "ceqanet_debug_no_advanced")
+    raise RuntimeError("Could not open Advanced Search. Saved ceqanet_debug_no_advanced.*")
+
+
+# =============================
+# Self-check utilities
+# =============================
+
+def self_check_ceqanet(timeout_ms: int = 120_000) -> None:
+    """
+    Fails fast if CEQAnet cannot reach Advanced Search in the current environment.
+    Saves debug artifacts on failure.
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        context = browser.new_context(
+            viewport={"width": 1366, "height": 768},
+            locale="en-US",
+        )
+        page = context.new_page()
+        try:
+            _open_advanced_search(page, timeout_ms=timeout_ms)
+            assert page.locator("text=Start Range").first.is_visible(timeout=15_000)
+            assert page.locator("text=End Range").first.is_visible(timeout=15_000)
+            assert page.locator("text=Document Type").first.is_visible(timeout=15_000)
+            print("✅ SELF-CHECK: Advanced Search reachable; key controls visible.")
+        except Exception:
+            _dump_debug(page, "ceqanet_selfcheck_failed")
+            raise RuntimeError("SELF-CHECK failed: Advanced Search not reachable. Saved ceqanet_selfcheck_failed.*")
+        finally:
+            browser.close()
+
+
+def assert_non_empty_rows(rows: List[Dict[str, str]], label: str) -> None:
+    if not rows:
+        raise RuntimeError(f"SELF-CHECK failed: {label} returned 0 rows (possible block/UI change).")
+
+    sample = rows[0]
+    # Ensure export looks like CEQAnet (has at least some expected columns)
+    expected_any = {"title", "project title", "document title", "received", "county", "city", "document type", "type"}
+    if not any(k.lower() in expected_any for k in sample.keys()):
+        raise RuntimeError(f"SELF-CHECK failed: {label} CSV columns look unexpected. Keys={list(sample.keys())[:25]}")
 
 
 # =============================
@@ -377,9 +371,6 @@ def _open_advanced_search(page, timeout_ms: int = 60_000) -> None:
 # =============================
 
 def _extract_kv_section(section_text: str) -> Dict[str, str]:
-    """
-    CEQAnet detail pages render as label/value pairs. We parse by scanning known labels.
-    """
     labels = {
         "ceqanet id",
         "lead agency",
@@ -395,12 +386,10 @@ def _extract_kv_section(section_text: str) -> Dict[str, str]:
 
     lines = [ln.strip() for ln in section_text.splitlines() if ln.strip()]
     kv: Dict[str, str] = {}
-
     i = 0
     while i < len(lines):
         k = lines[i].strip().lower()
         if k in labels:
-            # value is next non-label line
             j = i + 1
             val = ""
             while j < len(lines):
@@ -414,32 +403,23 @@ def _extract_kv_section(section_text: str) -> Dict[str, str]:
             i = j
         else:
             i += 1
-
     return kv
 
 
 def scrape_ceqa_detail(detail_url: str, timeout_ms: int = 120_000) -> Dict[str, object]:
-    """
-    Returns:
-      {
-        "summary": {...},
-        "contacts": [ {name, agency_name, job_title, contact_types, address, phone, email}, ... ],
-        "location": {...}
-      }
-    """
     out: Dict[str, object] = {"summary": {}, "contacts": [], "location": {}}
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        context = browser.new_context(viewport={"width": 1366, "height": 768}, locale="en-US")
         page = context.new_page()
 
         page.goto(detail_url, wait_until="domcontentloaded", timeout=timeout_ms)
-        page.wait_for_timeout(900)
+        page.wait_for_timeout(700)
+        _dismiss_banners(page)
 
         body_text = page.locator("body").inner_text(timeout=20_000)
 
-        # Summary is typically between "Summary" and "Contact Information"
         s_idx = body_text.lower().find("summary")
         c_idx = body_text.lower().find("contact information")
         l_idx = body_text.lower().find("\nlocation")
@@ -448,7 +428,6 @@ def scrape_ceqa_detail(detail_url: str, timeout_ms: int = 120_000) -> Dict[str, 
             summary_text = body_text[s_idx:c_idx]
             out["summary"] = _extract_kv_section(summary_text)
 
-        # Contacts between "Contact Information" and "Location"
         contacts: List[Dict[str, str]] = []
         if c_idx != -1:
             tail = body_text[c_idx:]
@@ -494,7 +473,6 @@ def scrape_ceqa_detail(detail_url: str, timeout_ms: int = 120_000) -> Dict[str, 
                     i += 1
             flush()
 
-        # Normalize contacts
         normed: List[Dict[str, str]] = []
         for c in contacts:
             normed.append({
@@ -506,26 +484,23 @@ def scrape_ceqa_detail(detail_url: str, timeout_ms: int = 120_000) -> Dict[str, 
                 "phone": c.get("phone", ""),
                 "email": c.get("email", ""),
             })
-
         out["contacts"] = normed
 
-        # Location section (simple parse)
         if l_idx != -1:
             loc_text = body_text[l_idx:]
-            # pull a compact set of location fields if present
-            loc_fields = ["cities", "counties", "regions", "cross streets", "zip", "total acres", "parcel(s)", "state highways", "township", "range", "section", "base"]
+            loc_fields = [
+                "cities", "counties", "regions", "cross streets", "zip",
+                "total acres", "parcel(s)", "state highways", "township",
+                "range", "section", "base"
+            ]
             loc_lines = [ln.strip() for ln in loc_text.splitlines() if ln.strip()]
             loc: Dict[str, str] = {}
             i = 0
             while i < len(loc_lines):
                 k = loc_lines[i].strip().lower()
-                if k in loc_fields:
-                    if i + 1 < len(loc_lines):
-                        v = loc_lines[i + 1].strip()
-                        loc[k] = v
-                        i += 2
-                    else:
-                        i += 1
+                if k in loc_fields and (i + 1) < len(loc_lines):
+                    loc[k] = loc_lines[i + 1].strip()
+                    i += 2
                 else:
                     i += 1
             out["location"] = loc
@@ -544,76 +519,81 @@ def pick_preferred_contact(contacts: List[Dict[str, str]]) -> Optional[Dict[str,
             return c
     return contacts[0]
 
+
+# =============================
+# CEQAnet download
+# =============================
+
 def ceqanet_download_csv_for_range_and_doc_type(
     start_date_ddmmYYYY: str,
     end_date_ddmmYYYY: str,
     doc_type: str,
     timeout_ms: int = 180_000
 ) -> Tuple[bytes, str]:
-    """
-    Runs Advanced Search for date range + doc type, downloads CSV.
-    Returns (csv_bytes, results_page_url).
-    """
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(accept_downloads=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        context = browser.new_context(
+            accept_downloads=True,
+            viewport={"width": 1366, "height": 768},
+            locale="en-US",
+        )
         page = context.new_page()
 
         _open_advanced_search(page, timeout_ms=timeout_ms)
-        page.wait_for_timeout(600)
+        page.wait_for_timeout(500)
 
-        # Fill dates using the row labels (matches screenshot)
         ok_start = _fill_input_by_row_text(page, "Start Range", start_date_ddmmYYYY)
-        ok_end   = _fill_input_by_row_text(page, "End Range", end_date_ddmmYYYY)
+        ok_end = _fill_input_by_row_text(page, "End Range", end_date_ddmmYYYY)
         if not ok_start or not ok_end:
-            page.screenshot(path="ceqanet_debug_date_fill_failed.png", full_page=True)
-            raise RuntimeError("Could not fill Start/End Range. Saved ceqanet_debug_date_fill_failed.png")
+            _dump_debug(page, "ceqanet_debug_date_fill_failed")
+            raise RuntimeError("Could not fill Start/End Range. Saved ceqanet_debug_date_fill_failed.*")
 
-        # Select document type (NOP / NOE)
         ok_doc = _select_by_row_text(page, "Document Type", doc_type)
         if not ok_doc:
-            page.screenshot(path="ceqanet_debug_doc_type_select_failed.png", full_page=True)
-            raise RuntimeError(f"Could not select Document Type={doc_type}. Saved ceqanet_debug_doc_type_select_failed.png")
+            _dump_debug(page, "ceqanet_debug_doc_type_select_failed")
+            raise RuntimeError(f"Could not select Document Type={doc_type}. Saved ceqanet_debug_doc_type_select_failed.*")
 
-        # Click Get Results
         clicked = _click_first(page, [
             "button:has-text('Get Results')",
             "input[value='Get Results']",
             "text=Get Results",
-        ], timeout_ms=15_000)
+        ], timeout_ms=20_000)
 
         if not clicked:
-            page.screenshot(path="ceqanet_debug_no_get_results.png", full_page=True)
-            raise RuntimeError("Could not click Get Results. Saved ceqanet_debug_no_get_results.png")
+            _dump_debug(page, "ceqanet_debug_no_get_results")
+            raise RuntimeError("Could not click Get Results. Saved ceqanet_debug_no_get_results.*")
 
-        # Wait for results page + download control
         try:
-            page.wait_for_selector("text=Download CSV", timeout=45_000)
+            page.wait_for_selector("text=Download CSV", timeout=60_000)
         except PWTimeoutError:
-            page.screenshot(path="ceqanet_debug_results_no_download.png", full_page=True)
-            raise RuntimeError("Results loaded but no Download CSV found. Saved ceqanet_debug_results_no_download.png")
+            _dump_debug(page, "ceqanet_debug_results_no_download")
+            raise RuntimeError("Results loaded but no Download CSV found. Saved ceqanet_debug_results_no_download.*")
 
-        # Download CSV
         try:
-            with page.expect_download(timeout=90_000) as dl_info:
+            with page.expect_download(timeout=120_000) as dl_info:
                 ok_dl = _click_first(page, [
                     "text=Download CSV",
                     "button:has-text('Download CSV')",
                     "a:has-text('Download CSV')",
                     "a[href*='csv' i]",
-                ], timeout_ms=15_000)
+                ], timeout_ms=20_000)
                 if not ok_dl:
-                    page.screenshot(path="ceqanet_debug_no_download_csv.png", full_page=True)
-                    raise RuntimeError("Could not click Download CSV.")
+                    _dump_debug(page, "ceqanet_debug_no_download_click")
+                    raise RuntimeError("Could not click Download CSV. Saved ceqanet_debug_no_download_click.*")
+
             download = dl_info.value
             csv_bytes = open(download.path(), "rb").read()
         except Exception as e:
-            page.screenshot(path="ceqanet_debug_download_failed.png", full_page=True)
-            raise RuntimeError(f"CSV download failed. Saved ceqanet_debug_download_failed.png. Error={e}")
+            _dump_debug(page, "ceqanet_debug_download_failed")
+            raise RuntimeError(f"CSV download failed. Saved ceqanet_debug_download_failed.* Error={e}")
 
         results_url = page.url
         browser.close()
         return csv_bytes, results_url
+
 
 # =============================
 # Main
@@ -623,6 +603,11 @@ def main():
     if not SHEET_ID or not TAB_NAME:
         raise RuntimeError("Missing LA_SHEET_ID or LA_TAB_NAME env vars")
 
+    print(f"CEQAnet (CA) | pulling records from {DATE_START} → {DATE_END} for doc types: {DOC_TYPES}")
+
+    # Fail fast if CI cannot reach Advanced Search
+    self_check_ceqanet(timeout_ms=120_000)
+
     gc = get_gspread_client()
     sh = gc.open_by_key(SHEET_ID)
     ws = sh.worksheet(TAB_NAME)
@@ -630,18 +615,23 @@ def main():
     hmap = header_map(ws)
     existing_ids = load_existing_ids(ws, id_col=1)
 
-    print(f"CEQAnet (CA) | pulling records from {DATE_START} → {DATE_END} for doc types: {DOC_TYPES}")
-
     all_rows: List[Dict[str, str]] = []
     any_results_url = ""
 
-    # Run 2 searches: NOP and NOE
-    for dt in DOC_TYPES:
+    for idx, dt in enumerate(DOC_TYPES):
         csv_bytes, results_url = ceqanet_download_csv_for_range_and_doc_type(DATE_START, DATE_END, dt)
         any_results_url = results_url or any_results_url
         part = parse_csv_bytes(csv_bytes)
+
+        # Mid-run self-check that export is not empty / not malformed
+        assert_non_empty_rows(part, label=f"CEQAnet export for {dt}")
+
         print(f"Downloaded rows for {dt}: {len(part)}")
         all_rows.extend(part)
+
+        # Optional extra check after first doc type
+        if idx == 0:
+            print("✅ SELF-CHECK: First export succeeded; continuing...")
 
     print(f"Total downloaded rows (combined): {len(all_rows)}")
     if not all_rows:
@@ -657,10 +647,9 @@ def main():
         if appended >= MAX_NEW:
             break
 
-        # CSV fields (vary by export; we try multiple names)
         sch = pick(r, ["SCH Number", "SCH", "SCH#", "State Clearinghouse Number"])
-        title = pick(r, ["Title", "Project Title", "Project"])
-        lead = pick(r, ["Lead/Public Agency", "Lead Agency", "Agency"])
+        title = pick(r, ["Title", "Project Title", "Project", "Document Title"])
+        lead = pick(r, ["Lead/Public Agency", "Lead Agency", "Agency", "Lead Agency Title"])
         received = pick(r, ["Received", "Received Date", "Date Received"])
         doc_type = pick(r, ["Type", "Document Type", "Doc Type"])
         county = pick(r, ["County"])
@@ -668,13 +657,19 @@ def main():
         dev_type = pick(r, ["Development Type", "Dev Type", "Development"])
         location_csv = pick(r, ["Location", "Project Location", "Address"])
 
-        # Detail URL + CEQA ID
         detail_url = ceqa_detail_url_from_row(r)
         ceqa_id = ""
         if detail_url.startswith(CEQANET_URL):
             ceqa_id = detail_url.replace(CEQANET_URL, "").strip("/")
 
-        award_id = stable_award_id(ceqa_id=ceqa_id, sch=sch, title=title, doc_type=doc_type, received=received)
+        award_id = stable_award_id(
+            ceqa_id=ceqa_id,
+            sch=sch,
+            title=title,
+            doc_type=doc_type,
+            received=received
+        )
+
         if award_id in existing_ids:
             continue
 
@@ -685,47 +680,35 @@ def main():
         if ENRICH_DETAILS and detail_url and detail_used < DETAIL_CAP:
             try:
                 d = scrape_ceqa_detail(detail_url, timeout_ms=150_000)
-                detail_summary = d.get("summary", {}) or {}
-                detail_contacts = d.get("contacts", []) or []
-                detail_location = d.get("location", {}) or {}
+                detail_summary = (d.get("summary") or {})  # type: ignore
+                detail_contacts = (d.get("contacts") or [])  # type: ignore
+                detail_location = (d.get("location") or {})  # type: ignore
                 detail_used += 1
             except Exception as e:
                 print(f"[DETAIL] Failed for URL={detail_url}: {e}")
 
         chosen = pick_preferred_contact(detail_contacts)
 
-        # Project description: prefer detail page content
         present_land_use = (detail_summary.get("present land use") or "").strip()
         proposed = (detail_summary.get("proposed project") or "").strip()
         proj_desc = (detail_summary.get("project description") or "").strip()
 
-        description_blob = " | ".join([x for x in [present_land_use, proj_desc, proposed] if x])
-        if not description_blob:
-            description_blob = title
+        description_blob = " | ".join([x for x in [present_land_use, proj_desc, proposed] if x]) or title
 
-        # Stage/doc type: prefer detail page
         stage = (detail_summary.get("document type") or doc_type or "").strip()
-
-        # Received/submitted date: prefer detail page
         submitted = (detail_summary.get("received") or received or "").strip()
 
-        # “When” if possible: review end dates
         state_review_end = (detail_summary.get("state review period end") or "").strip()
         public_review_end = (detail_summary.get("public review period end") or "").strip()
 
-        # Where: prefer detail location cities/counties; fall back to CSV
         loc_city = (detail_location.get("cities") or city or "").strip()
         loc_county = (detail_location.get("counties") or county or "").strip()
         place_of_perf = ", ".join([x for x in [loc_city, loc_county, "CA"] if x])
 
-        # Private-side company: best proxy is Applicant / Consulting Firm agency name
         recipient_company = (chosen.get("agency_name", "") if chosen else "")
-
         is_constructionish = looks_like_construction_project(title=title, desc=description_blob, dev_type=dev_type)
 
         contacts_json = json.dumps(detail_contacts, ensure_ascii=False)
-
-        # Award link = actual detail link when available
         award_link = detail_url or (any_results_url if any_results_url else f"SCH={sch}")
 
         values = {
@@ -735,7 +718,7 @@ def main():
             "Parent Recipient UEI": "",
             "Parent Recipient DUNS": "",
             "Recipient (HQ) Address": (chosen.get("address", "") if chosen else "") or location_csv,
-            "Start Date": "2026-01-01",  # marker for your 2026 pipeline
+            "Start Date": "2026-01-01",
             "End Date": "",
             "Last Modified Date": now,
             "Award Amount (Obligated)": "",
@@ -743,8 +726,6 @@ def main():
             "NAICS Description": "",
             "Awarding Agency": lead,
             "Place of Performance": place_of_perf,
-
-            # Put the info you asked for directly into Description
             "Description": (
                 f"Stage={stage}"
                 f" | Submitted={submitted}"
@@ -752,11 +733,9 @@ def main():
                 f" | ReviewEnd(Public)={public_review_end}"
                 f" | {description_blob}"
             ).strip(),
-
             "Award Link": award_link,
             "Recipient Profile Link": "",
             "Web Search Link": "",
-
             "Company Website": "",
             "Company Phone": (chosen.get("phone", "") if chosen else ""),
             "Company General Email": (chosen.get("email", "") if chosen else ""),
@@ -764,7 +743,6 @@ def main():
             "Responsible Person Role": (chosen.get("job_title", "") if chosen else ""),
             "Responsible Person Email": (chosen.get("email", "") if chosen else ""),
             "Responsible Person Phone": (chosen.get("phone", "") if chosen else ""),
-
             "confidence_score": "70" if detail_contacts else "55",
             "prediction_rationale": "ceqanet_adv_search(+55); detail_page(+15)" if detail_contacts else "ceqanet_adv_search(+55)",
             "target_flag": "TRUE",
@@ -772,7 +750,6 @@ def main():
             "data_source": "CEQAnet (CA State Clearinghouse)",
             "data_confidence_level": "Medium",
             "last_verified_date": now,
-
             "notes": (
                 f"CEQA_ID={ceqa_id}; SCH={sch}; DocType={stage}; Submitted={submitted}; "
                 f"DevType={dev_type}; construction_hint={is_constructionish}; "
