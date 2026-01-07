@@ -23,22 +23,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run ATX pipeline (Austin Open Data / Socrata)
+      - name: Run TX pipeline (Austin Open Data)
         env:
-          # Google credentials
           ATX_GOOGLE_CREDENTIALS_JSON: ${{ secrets.ATX_GOOGLE_CREDENTIALS_JSON }}
 
-          # Google Sheet destination
-          ATX_SHEET_ID: 1uXC-sW0xnJe1erIbuEYFM7R6cyeq7NFWPCfWCjEr8Ug
-          ATX_TAB_NAME: Awards_Raw_TX
+          TX_SHEET_ID: 1uXC-sW0xnJe1erIbuEYFM7R6cyeq7NFWPCfWCjEr8Ug
+          TX_TAB_NAME: Awards_Raw_TX
 
-          # Pull controls
-          ATX_SINCE_DATE: "2025-12-15"
-          ATX_MAX_NEW: "2000"
-          ATX_SLEEP_SECONDS: "0.05"
+          TX_ISSUED_SINCE: "2025-12-15"
+          TX_WORK_CLASS_REQUIRED: "NEW"
 
-          # Dataset (Austin Open Data – Issued Construction Permits)
-          ATX_DATASET_ID: "3syk-w9eu"
+          TX_MAX_NEW: "2000"
+          TX_SLEEP_SECONDS: "0.05"
+          TX_DATASET_ID: "3syk-w9eu"
 
+          TX_ENRICH_WEBSITE: "true"
+          TX_WEBSITE_LOOKUP_CAP: "400"
         run: |
-          python scripts/atx/atx_run.py
+          python scripts/tx/tx_run.py
