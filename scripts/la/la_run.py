@@ -4,12 +4,14 @@ import json
 import time
 import csv
 import hashlib
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+import re
+from datetime import datetime, timezone, date
+from typing import Dict, List, Optional, Tuple, Set
 
 import gspread
 from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+
 
 # =============================
 # CONFIG
@@ -17,14 +19,17 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
 CEQANET_URL = "https://ceqanet.lci.ca.gov/"
 
-# CEQAnet date format in UI: dd.mm.yyyy
+# Advanced Search date range (dd.mm.yyyy)
 DATE_START = os.environ.get("LA_CEQANET_DATE_START", "15.12.2025")
 DATE_END = os.environ.get("LA_CEQANET_DATE_END", "31.12.2026")
 
-# Document types you requested
+# Fallback filtering (ISO date)
+SINCE_ISO = os.environ.get("LA_CEQANET_SINCE", "2025-12-15")
+SINCE_DATE = datetime.strptime(SINCE_ISO, "%Y-%m-%d").date()
+
 DOC_TYPES = ["NOP", "NOE"]
 
-# Google Sheet (reuse your existing env vars)
+# Google Sheet
 SHEET_ID = os.environ.get("LA_SHEET_ID")
 TAB_NAME = os.environ.get("LA_TAB_NAME")
 CREDS_ENV = "LA_GOOGLE_CREDENTIALS_JSON"
@@ -35,9 +40,12 @@ SLEEP_SECONDS = float(os.environ.get("LA_SLEEP_SECONDS", "0.10"))
 
 # Detail scraping controls
 ENRICH_DETAILS = os.environ.get("LA_ENRICH_DETAILS", "true").lower() == "true"
-DETAIL_CAP = int(os.environ.get("LA_DETAIL_CAP", "200"))  # details are slower
+DETAIL_CAP = int(os.environ.get("LA_DETAIL_CAP", "200"))
 
-# Prefer these contact types for your “responsible people”
+# Recent fallback paging controls
+MAX_RECENT_PAGES = int(os.environ.get("LA_CEQANET_RECENT_PAGES", "40"))
+MAX_DETAIL_VISITS = int(os.environ.get("LA_CEQANET_DETAIL_VISITS", "800"))  # cap for fallback mode
+
 PREFERRED_CONTACT_TYPES = {
     "Project Applicant",
     "Consulting Firm",
@@ -127,6 +135,40 @@ def looks_like_construction_project(title: str, desc: str, dev_type: str) -> boo
     return any(k in blob for k in keywords)
 
 
+def parse_date_flexible(s: str) -> Optional[date]:
+    """
+    CEQAnet 'Received' formats can vary. Try common patterns.
+    Returns a date or None.
+    """
+    s = normalize_str(s)
+    if not s:
+        return None
+
+    # normalize separators
+    s2 = s.replace("\\", "/").replace("-", "/").replace(".", "/")
+    s2 = re.sub(r"\s+", "", s2)
+
+    # try yyyy/mm/dd
+    m = re.match(r"^(20\d{2})/(\d{1,2})/(\d{1,2})$", s2)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        return date(y, mo, d)
+
+    # try mm/dd/yyyy
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(20\d{2})$", s2)
+    if m:
+        mo, d, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        return date(y, mo, d)
+
+    # try dd/mm/yyyy (less common but possible if localized)
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(20\d{2})$", s2)
+    if m:
+        # ambiguous with mm/dd; keep as mm/dd above already.
+        pass
+
+    return None
+
+
 def ceqa_detail_url_from_row(row: Dict[str, str]) -> str:
     ceqa_id = pick(row, ["CEQA #", "CEQA Number", "CEQAnet ID", "Entry ID", "CEQA ID", "ID"])
     ceqa_id = ceqa_id.replace("-", "").replace(" ", "")
@@ -202,9 +244,25 @@ def _dismiss_banners(page) -> None:
             loc = page.locator(sel).first
             if loc.is_visible(timeout=800):
                 loc.click(timeout=1500, force=True)
-                page.wait_for_timeout(300)
+                page.wait_for_timeout(250)
         except Exception:
             pass
+
+
+def _is_service_unavailable(page) -> bool:
+    try:
+        t = (page.title() or "").lower()
+        if "service unavailable" in t:
+            return True
+    except Exception:
+        pass
+    try:
+        body = (page.locator("body").inner_text(timeout=2_000) or "").lower()
+        if "service unavailable" in body or "503" in body:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _is_on_advanced_form(page) -> bool:
@@ -260,110 +318,38 @@ def _select_by_row_text(page, row_text: str, option_text: str, timeout_ms: int =
 
 
 def _open_advanced_search(page, timeout_ms: int = 60_000) -> None:
+    """
+    Attempt to open Advanced Search. If the endpoint is returning "Service unavailable",
+    raise a RuntimeError (caller will fallback to /Search/Recent).
+    """
     advanced_url_candidates = [
         "https://ceqanet.lci.ca.gov/Search/AdvancedSearch",
+        "https://ceqanet.lci.ca.gov/advancedsearch",
         "https://ceqanet.lci.ca.gov/search/advancedsearch",
         "https://ceqanet.lci.ca.gov/Search/Advanced",
         "https://ceqanet.lci.ca.gov/search/advanced",
-        "https://ceqanet.lci.ca.gov/AdvancedSearch",
-        "https://ceqanet.lci.ca.gov/advancedsearch",
     ]
 
-    def goto_and_check(url: str) -> bool:
+    for u in advanced_url_candidates:
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.goto(u, wait_until="domcontentloaded", timeout=timeout_ms)
             page.wait_for_timeout(800)
             _dismiss_banners(page)
             page.wait_for_timeout(300)
-            return _is_on_advanced_form(page)
+
+            if _is_service_unavailable(page):
+                _dump_debug(page, "ceqanet_debug_advanced_service_unavailable")
+                raise RuntimeError("Advanced Search is Service unavailable (503).")
+
+            if _is_on_advanced_form(page):
+                return
+        except RuntimeError:
+            raise
         except Exception:
-            return False
-
-    # 1) direct URL attempts
-    for u in advanced_url_candidates:
-        if goto_and_check(u):
-            return
-
-    # 2) fallback to Recent
-    recent_url = "https://ceqanet.lci.ca.gov/Search/Recent"
-    page.goto(recent_url, wait_until="domcontentloaded", timeout=timeout_ms)
-    page.wait_for_timeout(1000)
-    _dismiss_banners(page)
-    page.wait_for_timeout(400)
-
-    try:
-        page.get_by_role("link", name="Advanced Search", exact=False).click(timeout=6_000, force=True)
-        page.wait_for_timeout(800)
-        _dismiss_banners(page)
-        if _is_on_advanced_form(page):
-            return
-    except Exception:
-        pass
-
-    clicked = _click_first(page, [
-        "a[href*='AdvancedSearch' i]",
-        "a[href*='advancedsearch' i]",
-        "a[href*='Search/Advanced' i]",
-        "a:has-text('Advanced')",
-        "text=Advanced Search",
-    ], timeout_ms=10_000)
-
-    if clicked:
-        page.wait_for_timeout(900)
-        _dismiss_banners(page)
-        if _is_on_advanced_form(page):
-            return
-
-    # final attempt
-    for u in advanced_url_candidates:
-        if goto_and_check(u):
-            return
+            continue
 
     _dump_debug(page, "ceqanet_debug_no_advanced")
-    raise RuntimeError("Could not open Advanced Search. Saved ceqanet_debug_no_advanced.*")
-
-
-# =============================
-# Self-check utilities
-# =============================
-
-def self_check_ceqanet(timeout_ms: int = 120_000) -> None:
-    """
-    Fails fast if CEQAnet cannot reach Advanced Search in the current environment.
-    Saves debug artifacts on failure.
-    """
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        context = browser.new_context(
-            viewport={"width": 1366, "height": 768},
-            locale="en-US",
-        )
-        page = context.new_page()
-        try:
-            _open_advanced_search(page, timeout_ms=timeout_ms)
-            assert page.locator("text=Start Range").first.is_visible(timeout=15_000)
-            assert page.locator("text=End Range").first.is_visible(timeout=15_000)
-            assert page.locator("text=Document Type").first.is_visible(timeout=15_000)
-            print("✅ SELF-CHECK: Advanced Search reachable; key controls visible.")
-        except Exception:
-            _dump_debug(page, "ceqanet_selfcheck_failed")
-            raise RuntimeError("SELF-CHECK failed: Advanced Search not reachable. Saved ceqanet_selfcheck_failed.*")
-        finally:
-            browser.close()
-
-
-def assert_non_empty_rows(rows: List[Dict[str, str]], label: str) -> None:
-    if not rows:
-        raise RuntimeError(f"SELF-CHECK failed: {label} returned 0 rows (possible block/UI change).")
-
-    sample = rows[0]
-    # Ensure export looks like CEQAnet (has at least some expected columns)
-    expected_any = {"title", "project title", "document title", "received", "county", "city", "document type", "type"}
-    if not any(k.lower() in expected_any for k in sample.keys()):
-        raise RuntimeError(f"SELF-CHECK failed: {label} CSV columns look unexpected. Keys={list(sample.keys())[:25]}")
+    raise RuntimeError("Could not open Advanced Search (not found or blocked).")
 
 
 # =============================
@@ -406,106 +392,102 @@ def _extract_kv_section(section_text: str) -> Dict[str, str]:
     return kv
 
 
-def scrape_ceqa_detail(detail_url: str, timeout_ms: int = 120_000) -> Dict[str, object]:
+def scrape_ceqa_detail_in_page(page, detail_url: str, timeout_ms: int = 120_000) -> Dict[str, object]:
+    """
+    Uses an existing Playwright page (reused) to scrape detail URL.
+    """
     out: Dict[str, object] = {"summary": {}, "contacts": [], "location": {}}
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        context = browser.new_context(viewport={"width": 1366, "height": 768}, locale="en-US")
-        page = context.new_page()
+    page.goto(detail_url, wait_until="domcontentloaded", timeout=timeout_ms)
+    page.wait_for_timeout(700)
+    _dismiss_banners(page)
 
-        page.goto(detail_url, wait_until="domcontentloaded", timeout=timeout_ms)
-        page.wait_for_timeout(700)
-        _dismiss_banners(page)
+    body_text = page.locator("body").inner_text(timeout=20_000)
 
-        body_text = page.locator("body").inner_text(timeout=20_000)
+    s_idx = body_text.lower().find("summary")
+    c_idx = body_text.lower().find("contact information")
+    l_idx = body_text.lower().find("\nlocation")
 
-        s_idx = body_text.lower().find("summary")
-        c_idx = body_text.lower().find("contact information")
-        l_idx = body_text.lower().find("\nlocation")
+    if s_idx != -1 and c_idx != -1 and c_idx > s_idx:
+        summary_text = body_text[s_idx:c_idx]
+        out["summary"] = _extract_kv_section(summary_text)
 
-        if s_idx != -1 and c_idx != -1 and c_idx > s_idx:
-            summary_text = body_text[s_idx:c_idx]
-            out["summary"] = _extract_kv_section(summary_text)
+    contacts: List[Dict[str, str]] = []
+    if c_idx != -1:
+        tail = body_text[c_idx:]
+        end = tail.lower().find("\nlocation")
+        section = tail[:end] if end != -1 else tail
 
-        contacts: List[Dict[str, str]] = []
-        if c_idx != -1:
-            tail = body_text[c_idx:]
-            end = tail.lower().find("\nlocation")
-            section = tail[:end] if end != -1 else tail
+        labels = {
+            "name",
+            "agency name",
+            "job title",
+            "contact types",
+            "address",
+            "phone",
+            "email",
+        }
+        lines = [ln.strip() for ln in section.splitlines() if ln.strip()]
+        current: Dict[str, str] = {}
 
-            labels = {
-                "name",
-                "agency name",
-                "job title",
-                "contact types",
-                "address",
-                "phone",
-                "email",
-            }
-            lines = [ln.strip() for ln in section.splitlines() if ln.strip()]
-            current: Dict[str, str] = {}
+        def flush():
+            nonlocal current
+            if current:
+                contacts.append(current)
+                current = {}
 
-            def flush():
-                nonlocal current
-                if current:
-                    contacts.append(current)
-                    current = {}
-
-            i = 0
-            while i < len(lines):
-                key = lines[i].strip().lower()
-                if key in labels:
-                    if key == "name" and current.get("name"):
-                        flush()
-                    j = i + 1
-                    val = ""
-                    while j < len(lines):
-                        nxt = lines[j].strip()
-                        if nxt.lower() in labels:
-                            break
-                        val = nxt
+        i = 0
+        while i < len(lines):
+            key = lines[i].strip().lower()
+            if key in labels:
+                if key == "name" and current.get("name"):
+                    flush()
+                j = i + 1
+                val = ""
+                while j < len(lines):
+                    nxt = lines[j].strip()
+                    if nxt.lower() in labels:
                         break
-                    if val:
-                        current[key] = val
-                    i = j
-                else:
-                    i += 1
-            flush()
+                    val = nxt
+                    break
+                if val:
+                    current[key] = val
+                i = j
+            else:
+                i += 1
+        flush()
 
-        normed: List[Dict[str, str]] = []
-        for c in contacts:
-            normed.append({
-                "name": c.get("name", ""),
-                "agency_name": c.get("agency name", ""),
-                "job_title": c.get("job title", ""),
-                "contact_types": c.get("contact types", ""),
-                "address": c.get("address", ""),
-                "phone": c.get("phone", ""),
-                "email": c.get("email", ""),
-            })
-        out["contacts"] = normed
+    normed: List[Dict[str, str]] = []
+    for c in contacts:
+        normed.append({
+            "name": c.get("name", ""),
+            "agency_name": c.get("agency name", ""),
+            "job_title": c.get("job title", ""),
+            "contact_types": c.get("contact types", ""),
+            "address": c.get("address", ""),
+            "phone": c.get("phone", ""),
+            "email": c.get("email", ""),
+        })
+    out["contacts"] = normed
 
-        if l_idx != -1:
-            loc_text = body_text[l_idx:]
-            loc_fields = [
-                "cities", "counties", "regions", "cross streets", "zip",
-                "total acres", "parcel(s)", "state highways", "township",
-                "range", "section", "base"
-            ]
-            loc_lines = [ln.strip() for ln in loc_text.splitlines() if ln.strip()]
-            loc: Dict[str, str] = {}
-            i = 0
-            while i < len(loc_lines):
-                k = loc_lines[i].strip().lower()
-                if k in loc_fields and (i + 1) < len(loc_lines):
-                    loc[k] = loc_lines[i + 1].strip()
-                    i += 2
-                else:
-                    i += 1
-            out["location"] = loc
-
-        browser.close()
+    if l_idx != -1:
+        loc_text = body_text[l_idx:]
+        loc_fields = [
+            "cities", "counties", "regions", "cross streets", "zip",
+            "total acres", "parcel(s)", "state highways", "township",
+            "range", "section", "base"
+        ]
+        loc_lines = [ln.strip() for ln in loc_text.splitlines() if ln.strip()]
+        loc: Dict[str, str] = {}
+        i = 0
+        while i < len(loc_lines):
+            k = loc_lines[i].strip().lower()
+            if k in loc_fields and (i + 1) < len(loc_lines):
+                loc[k] = loc_lines[i + 1].strip()
+                i += 2
+            else:
+                i += 1
+        out["location"] = loc
 
     return out
 
@@ -521,7 +503,7 @@ def pick_preferred_contact(contacts: List[Dict[str, str]]) -> Optional[Dict[str,
 
 
 # =============================
-# CEQAnet download
+# Advanced Search mode (CSV export)
 # =============================
 
 def ceqanet_download_csv_for_range_and_doc_type(
@@ -596,6 +578,53 @@ def ceqanet_download_csv_for_range_and_doc_type(
 
 
 # =============================
+# Recent fallback mode
+# =============================
+
+def collect_detail_urls_from_recent(page, max_pages: int) -> List[str]:
+    """
+    Collects CEQAnet detail URLs from /Search/Recent by scanning for 10-digit IDs.
+    This is intentionally DOM-agnostic.
+    """
+    detail_urls: List[str] = []
+    seen: Set[str] = set()
+
+    page.goto("https://ceqanet.lci.ca.gov/Search/Recent", wait_until="domcontentloaded", timeout=120_000)
+    page.wait_for_timeout(1000)
+    _dismiss_banners(page)
+
+    for pageno in range(max_pages):
+        page.wait_for_timeout(600)
+
+        # Grab all hrefs and pull 10-digit CEQAnet IDs (e.g., 2026010057)
+        hrefs = page.locator("a[href]").evaluate_all("els => els.map(e => e.getAttribute('href'))")
+        for h in hrefs or []:
+            if not h:
+                continue
+            m = re.search(r"(20\d{8})", h)
+            if not m:
+                continue
+            ceqa_id = m.group(1)
+            u = f"{CEQANET_URL}{ceqa_id}"
+            if u not in seen:
+                seen.add(u)
+                detail_urls.append(u)
+
+        # Try to go next page
+        next_clicked = _click_first(page, [
+            "a:has-text('Next')",
+            "button:has-text('Next')",
+            "a[aria-label*='Next' i]",
+            "button[aria-label*='Next' i]",
+        ], timeout_ms=6_000)
+
+        if not next_clicked:
+            break
+
+    return detail_urls
+
+
+# =============================
 # Main
 # =============================
 
@@ -603,177 +632,327 @@ def main():
     if not SHEET_ID or not TAB_NAME:
         raise RuntimeError("Missing LA_SHEET_ID or LA_TAB_NAME env vars")
 
-    print(f"CEQAnet (CA) | pulling records from {DATE_START} → {DATE_END} for doc types: {DOC_TYPES}")
-
-    # Fail fast if CI cannot reach Advanced Search
-    self_check_ceqanet(timeout_ms=120_000)
+    print(f"CEQAnet (CA) | target doc types={DOC_TYPES} | since={SINCE_ISO}")
+    print(f"Advanced Search range attempt: {DATE_START} → {DATE_END}")
 
     gc = get_gspread_client()
     sh = gc.open_by_key(SHEET_ID)
     ws = sh.worksheet(TAB_NAME)
-
     hmap = header_map(ws)
     existing_ids = load_existing_ids(ws, id_col=1)
 
+    now = utc_now_str()
+
+    # -------------------------
+    # Attempt Advanced Search CSV mode
+    # -------------------------
     all_rows: List[Dict[str, str]] = []
     any_results_url = ""
 
-    for idx, dt in enumerate(DOC_TYPES):
-        csv_bytes, results_url = ceqanet_download_csv_for_range_and_doc_type(DATE_START, DATE_END, dt)
-        any_results_url = results_url or any_results_url
-        part = parse_csv_bytes(csv_bytes)
+    advanced_ok = True
+    try:
+        for dt in DOC_TYPES:
+            csv_bytes, results_url = ceqanet_download_csv_for_range_and_doc_type(DATE_START, DATE_END, dt)
+            any_results_url = results_url or any_results_url
+            part = parse_csv_bytes(csv_bytes)
+            print(f"Downloaded rows for {dt}: {len(part)}")
+            all_rows.extend(part)
 
-        # Mid-run self-check that export is not empty / not malformed
-        assert_non_empty_rows(part, label=f"CEQAnet export for {dt}")
+        if not all_rows:
+            # Treat empty export as suspicious and fallback
+            print("⚠️ Advanced Search returned 0 rows; switching to /Search/Recent fallback.")
+            advanced_ok = False
 
-        print(f"Downloaded rows for {dt}: {len(part)}")
-        all_rows.extend(part)
+    except Exception as e:
+        # If advanced search is unavailable or blocked in CI, fallback to Recent
+        print(f"⚠️ Advanced Search mode failed: {e}")
+        advanced_ok = False
 
-        # Optional extra check after first doc type
-        if idx == 0:
-            print("✅ SELF-CHECK: First export succeeded; continuing...")
-
-    print(f"Total downloaded rows (combined): {len(all_rows)}")
-    if not all_rows:
-        print("No rows parsed (empty export).")
-        return
-
-    now = utc_now_str()
+    # -------------------------
+    # Data production
+    # -------------------------
     rows_to_append: List[List[str]] = []
     appended = 0
-    detail_used = 0
 
-    for r in all_rows:
-        if appended >= MAX_NEW:
-            break
+    if advanced_ok:
+        # Use CSV rows + optional detail enrichment
+        detail_used = 0
 
-        sch = pick(r, ["SCH Number", "SCH", "SCH#", "State Clearinghouse Number"])
-        title = pick(r, ["Title", "Project Title", "Project", "Document Title"])
-        lead = pick(r, ["Lead/Public Agency", "Lead Agency", "Agency", "Lead Agency Title"])
-        received = pick(r, ["Received", "Received Date", "Date Received"])
-        doc_type = pick(r, ["Type", "Document Type", "Doc Type"])
-        county = pick(r, ["County"])
-        city = pick(r, ["City"])
-        dev_type = pick(r, ["Development Type", "Dev Type", "Development"])
-        location_csv = pick(r, ["Location", "Project Location", "Address"])
+        for r in all_rows:
+            if appended >= MAX_NEW:
+                break
 
-        detail_url = ceqa_detail_url_from_row(r)
-        ceqa_id = ""
-        if detail_url.startswith(CEQANET_URL):
-            ceqa_id = detail_url.replace(CEQANET_URL, "").strip("/")
+            sch = pick(r, ["SCH Number", "SCH", "SCH#", "State Clearinghouse Number"])
+            title = pick(r, ["Title", "Project Title", "Project", "Document Title"])
+            lead = pick(r, ["Lead/Public Agency", "Lead Agency", "Agency", "Lead Agency Title"])
+            received = pick(r, ["Received", "Received Date", "Date Received"])
+            doc_type = pick(r, ["Type", "Document Type", "Doc Type"])
+            county = pick(r, ["County"])
+            city = pick(r, ["City"])
+            dev_type = pick(r, ["Development Type", "Dev Type", "Development"])
+            location_csv = pick(r, ["Location", "Project Location", "Address"])
 
-        award_id = stable_award_id(
-            ceqa_id=ceqa_id,
-            sch=sch,
-            title=title,
-            doc_type=doc_type,
-            received=received
-        )
+            # Filter doc types strictly
+            if doc_type and doc_type.strip().upper() not in set(DOC_TYPES):
+                continue
 
-        if award_id in existing_ids:
-            continue
+            detail_url = ceqa_detail_url_from_row(r)
+            ceqa_id = ""
+            if detail_url.startswith(CEQANET_URL):
+                ceqa_id = detail_url.replace(CEQANET_URL, "").strip("/")
 
-        detail_summary: Dict[str, str] = {}
-        detail_contacts: List[Dict[str, str]] = []
-        detail_location: Dict[str, str] = {}
+            award_id = stable_award_id(ceqa_id=ceqa_id, sch=sch, title=title, doc_type=doc_type, received=received)
+            if award_id in existing_ids:
+                continue
 
-        if ENRICH_DETAILS and detail_url and detail_used < DETAIL_CAP:
-            try:
-                d = scrape_ceqa_detail(detail_url, timeout_ms=150_000)
+            # If we don't have a detail URL from CSV, we can still proceed but will have less data
+            detail_summary: Dict[str, str] = {}
+            detail_contacts: List[Dict[str, str]] = []
+            detail_location: Dict[str, str] = {}
+
+            # Enrich with detail page (best effort)
+            if ENRICH_DETAILS and detail_url and detail_used < DETAIL_CAP:
+                try:
+                    with sync_playwright() as p:
+                        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+                        context = browser.new_context(viewport={"width": 1366, "height": 768}, locale="en-US")
+                        page = context.new_page()
+                        d = scrape_ceqa_detail_in_page(page, detail_url, timeout_ms=150_000)
+                        detail_summary = (d.get("summary") or {})  # type: ignore
+                        detail_contacts = (d.get("contacts") or [])  # type: ignore
+                        detail_location = (d.get("location") or {})  # type: ignore
+                        browser.close()
+                    detail_used += 1
+                except Exception as e:
+                    print(f"[DETAIL] Failed for URL={detail_url}: {e}")
+
+            # Filter by received date since 2025-12-15 when possible (detail > csv)
+            submitted = (detail_summary.get("received") or received or "").strip()
+            submitted_dt = parse_date_flexible(submitted)
+            if submitted_dt and submitted_dt < SINCE_DATE:
+                continue
+
+            chosen = pick_preferred_contact(detail_contacts)
+
+            present_land_use = (detail_summary.get("present land use") or "").strip()
+            proposed = (detail_summary.get("proposed project") or "").strip()
+            proj_desc = (detail_summary.get("project description") or "").strip()
+            description_blob = " | ".join([x for x in [present_land_use, proj_desc, proposed] if x]) or title
+
+            stage = (detail_summary.get("document type") or doc_type or "").strip()
+            state_review_end = (detail_summary.get("state review period end") or "").strip()
+            public_review_end = (detail_summary.get("public review period end") or "").strip()
+
+            loc_city = (detail_location.get("cities") or city or "").strip()
+            loc_county = (detail_location.get("counties") or county or "").strip()
+            place_of_perf = ", ".join([x for x in [loc_city, loc_county, "CA"] if x])
+
+            recipient_company = (chosen.get("agency_name", "") if chosen else "")
+            is_constructionish = looks_like_construction_project(title=title, desc=description_blob, dev_type=dev_type)
+            contacts_json = json.dumps(detail_contacts, ensure_ascii=False)
+
+            award_link = detail_url or (any_results_url if any_results_url else f"SCH={sch}")
+
+            values = {
+                "Award ID": award_id,
+                "Recipient (Company)": recipient_company,
+                "Recipient UEI": "",
+                "Parent Recipient UEI": "",
+                "Parent Recipient DUNS": "",
+                "Recipient (HQ) Address": (chosen.get("address", "") if chosen else "") or location_csv,
+                "Start Date": "2026-01-01",
+                "End Date": "",
+                "Last Modified Date": now,
+                "Award Amount (Obligated)": "",
+                "NAICS Code": "",
+                "NAICS Description": "",
+                "Awarding Agency": lead,
+                "Place of Performance": place_of_perf,
+                "Description": (
+                    f"Stage={stage}"
+                    f" | Submitted={submitted}"
+                    f" | ReviewEnd(State)={state_review_end}"
+                    f" | ReviewEnd(Public)={public_review_end}"
+                    f" | {description_blob}"
+                ).strip(),
+                "Award Link": award_link,
+                "Recipient Profile Link": "",
+                "Web Search Link": "",
+                "Company Website": "",
+                "Company Phone": (chosen.get("phone", "") if chosen else ""),
+                "Company General Email": (chosen.get("email", "") if chosen else ""),
+                "Responsible Person Name": (chosen.get("name", "") if chosen else ""),
+                "Responsible Person Role": (chosen.get("job_title", "") if chosen else ""),
+                "Responsible Person Email": (chosen.get("email", "") if chosen else ""),
+                "Responsible Person Phone": (chosen.get("phone", "") if chosen else ""),
+                "confidence_score": "70" if detail_contacts else "55",
+                "prediction_rationale": "ceqanet_adv_search(+55); detail_page(+15)" if detail_contacts else "ceqanet_adv_search(+55)",
+                "target_flag": "TRUE",
+                "recipient_id": award_id,
+                "data_source": "CEQAnet (CA State Clearinghouse)",
+                "data_confidence_level": "Medium",
+                "last_verified_date": now,
+                "notes": (
+                    f"SINCE={SINCE_ISO}; SCH={sch}; DocType={stage}; Submitted={submitted}; "
+                    f"DevType={dev_type}; construction_hint={is_constructionish}; "
+                    f"DetailLoc={json.dumps(detail_location, ensure_ascii=False)}; "
+                    f"Contacts={contacts_json}"
+                ),
+            }
+
+            ordered = [""] * len(hmap)
+            for header, col_index in hmap.items():
+                ordered[col_index - 1] = values.get(header, "")
+
+            rows_to_append.append(ordered)
+            existing_ids.add(award_id)
+            appended += 1
+            time.sleep(SLEEP_SECONDS)
+
+        print(f"Advanced Search mode prepared rows: {len(rows_to_append)}")
+
+    else:
+        # -------------------------
+        # Recent fallback mode
+        # -------------------------
+        print("➡️ Using /Search/Recent fallback (Advanced Search unavailable in CI).")
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            context = browser.new_context(viewport={"width": 1366, "height": 768}, locale="en-US")
+            page = context.new_page()
+
+            detail_urls = collect_detail_urls_from_recent(page, max_pages=MAX_RECENT_PAGES)
+            print(f"Collected detail URLs from Recent: {len(detail_urls)} (pages scanned={MAX_RECENT_PAGES})")
+
+            # Mid-run self-check: if Recent yields nothing, dump debug and fail
+            if not detail_urls:
+                _dump_debug(page, "ceqanet_debug_recent_empty")
+                raise RuntimeError("Recent fallback yielded 0 detail URLs. Saved ceqanet_debug_recent_empty.*")
+
+            visited = 0
+            detail_used = 0
+
+            for u in detail_urls:
+                if appended >= MAX_NEW:
+                    break
+                if visited >= MAX_DETAIL_VISITS:
+                    break
+
+                visited += 1
+
+                try:
+                    d = scrape_ceqa_detail_in_page(page, u, timeout_ms=150_000)
+                except Exception as e:
+                    print(f"[DETAIL] Failed {u}: {e}")
+                    continue
+
                 detail_summary = (d.get("summary") or {})  # type: ignore
                 detail_contacts = (d.get("contacts") or [])  # type: ignore
                 detail_location = (d.get("location") or {})  # type: ignore
                 detail_used += 1
-            except Exception as e:
-                print(f"[DETAIL] Failed for URL={detail_url}: {e}")
 
-        chosen = pick_preferred_contact(detail_contacts)
+                stage = (detail_summary.get("document type") or "").strip().upper()
+                submitted = (detail_summary.get("received") or "").strip()
+                title = (detail_summary.get("document title") or "").strip()
+                lead = (detail_summary.get("lead agency") or "").strip()
 
-        present_land_use = (detail_summary.get("present land use") or "").strip()
-        proposed = (detail_summary.get("proposed project") or "").strip()
-        proj_desc = (detail_summary.get("project description") or "").strip()
+                # Fallback filters (these are your actual requirements)
+                if stage and stage not in set(DOC_TYPES):
+                    continue
 
-        description_blob = " | ".join([x for x in [present_land_use, proj_desc, proposed] if x]) or title
+                submitted_dt = parse_date_flexible(submitted)
+                if submitted_dt and submitted_dt < SINCE_DATE:
+                    continue
+                # If we cannot parse date, keep it (better to include than miss), but mark in notes.
 
-        stage = (detail_summary.get("document type") or doc_type or "").strip()
-        submitted = (detail_summary.get("received") or received or "").strip()
+                chosen = pick_preferred_contact(detail_contacts)
 
-        state_review_end = (detail_summary.get("state review period end") or "").strip()
-        public_review_end = (detail_summary.get("public review period end") or "").strip()
+                present_land_use = (detail_summary.get("present land use") or "").strip()
+                proposed = (detail_summary.get("proposed project") or "").strip()
+                proj_desc = (detail_summary.get("project description") or "").strip()
+                description_blob = " | ".join([x for x in [present_land_use, proj_desc, proposed] if x]) or title
 
-        loc_city = (detail_location.get("cities") or city or "").strip()
-        loc_county = (detail_location.get("counties") or county or "").strip()
-        place_of_perf = ", ".join([x for x in [loc_city, loc_county, "CA"] if x])
+                loc_city = (detail_location.get("cities") or "").strip()
+                loc_county = (detail_location.get("counties") or "").strip()
+                place_of_perf = ", ".join([x for x in [loc_city, loc_county, "CA"] if x])
 
-        recipient_company = (chosen.get("agency_name", "") if chosen else "")
-        is_constructionish = looks_like_construction_project(title=title, desc=description_blob, dev_type=dev_type)
+                ceqa_id = u.replace(CEQANET_URL, "").strip("/")
 
-        contacts_json = json.dumps(detail_contacts, ensure_ascii=False)
-        award_link = detail_url or (any_results_url if any_results_url else f"SCH={sch}")
+                award_id = stable_award_id(ceqa_id=ceqa_id, sch="", title=title, doc_type=stage, received=submitted)
+                if award_id in existing_ids:
+                    continue
 
-        values = {
-            "Award ID": award_id,
-            "Recipient (Company)": recipient_company,
-            "Recipient UEI": "",
-            "Parent Recipient UEI": "",
-            "Parent Recipient DUNS": "",
-            "Recipient (HQ) Address": (chosen.get("address", "") if chosen else "") or location_csv,
-            "Start Date": "2026-01-01",
-            "End Date": "",
-            "Last Modified Date": now,
-            "Award Amount (Obligated)": "",
-            "NAICS Code": "",
-            "NAICS Description": "",
-            "Awarding Agency": lead,
-            "Place of Performance": place_of_perf,
-            "Description": (
-                f"Stage={stage}"
-                f" | Submitted={submitted}"
-                f" | ReviewEnd(State)={state_review_end}"
-                f" | ReviewEnd(Public)={public_review_end}"
-                f" | {description_blob}"
-            ).strip(),
-            "Award Link": award_link,
-            "Recipient Profile Link": "",
-            "Web Search Link": "",
-            "Company Website": "",
-            "Company Phone": (chosen.get("phone", "") if chosen else ""),
-            "Company General Email": (chosen.get("email", "") if chosen else ""),
-            "Responsible Person Name": (chosen.get("name", "") if chosen else ""),
-            "Responsible Person Role": (chosen.get("job_title", "") if chosen else ""),
-            "Responsible Person Email": (chosen.get("email", "") if chosen else ""),
-            "Responsible Person Phone": (chosen.get("phone", "") if chosen else ""),
-            "confidence_score": "70" if detail_contacts else "55",
-            "prediction_rationale": "ceqanet_adv_search(+55); detail_page(+15)" if detail_contacts else "ceqanet_adv_search(+55)",
-            "target_flag": "TRUE",
-            "recipient_id": award_id,
-            "data_source": "CEQAnet (CA State Clearinghouse)",
-            "data_confidence_level": "Medium",
-            "last_verified_date": now,
-            "notes": (
-                f"CEQA_ID={ceqa_id}; SCH={sch}; DocType={stage}; Submitted={submitted}; "
-                f"DevType={dev_type}; construction_hint={is_constructionish}; "
-                f"DetailLoc={json.dumps(detail_location, ensure_ascii=False)}; "
-                f"Contacts={contacts_json}"
-            ),
-        }
+                is_constructionish = looks_like_construction_project(title=title, desc=description_blob, dev_type="")
+                contacts_json = json.dumps(detail_contacts, ensure_ascii=False)
 
-        ordered = [""] * len(hmap)
-        for header, col_index in hmap.items():
-            ordered[col_index - 1] = values.get(header, "")
+                values = {
+                    "Award ID": award_id,
+                    "Recipient (Company)": (chosen.get("agency_name", "") if chosen else ""),
+                    "Recipient UEI": "",
+                    "Parent Recipient UEI": "",
+                    "Parent Recipient DUNS": "",
+                    "Recipient (HQ) Address": (chosen.get("address", "") if chosen else ""),
+                    "Start Date": "2026-01-01",
+                    "End Date": "",
+                    "Last Modified Date": now,
+                    "Award Amount (Obligated)": "",
+                    "NAICS Code": "",
+                    "NAICS Description": "",
+                    "Awarding Agency": lead,
+                    "Place of Performance": place_of_perf,
+                    "Description": (
+                        f"Stage={stage or 'UNKNOWN'}"
+                        f" | Submitted={submitted or 'UNKNOWN'}"
+                        f" | {description_blob}"
+                    ).strip(),
+                    "Award Link": u,
+                    "Recipient Profile Link": "",
+                    "Web Search Link": "",
+                    "Company Website": "",
+                    "Company Phone": (chosen.get("phone", "") if chosen else ""),
+                    "Company General Email": (chosen.get("email", "") if chosen else ""),
+                    "Responsible Person Name": (chosen.get("name", "") if chosen else ""),
+                    "Responsible Person Role": (chosen.get("job_title", "") if chosen else ""),
+                    "Responsible Person Email": (chosen.get("email", "") if chosen else ""),
+                    "Responsible Person Phone": (chosen.get("phone", "") if chosen else ""),
+                    "confidence_score": "75",
+                    "prediction_rationale": "ceqanet_recent(+50); detail_page(+25)",
+                    "target_flag": "TRUE",
+                    "recipient_id": award_id,
+                    "data_source": "CEQAnet (CA State Clearinghouse) - Recent fallback",
+                    "data_confidence_level": "Medium",
+                    "last_verified_date": now,
+                    "notes": (
+                        f"SINCE={SINCE_ISO}; date_parsed={submitted_dt.isoformat() if submitted_dt else 'NO'}; "
+                        f"construction_hint={is_constructionish}; "
+                        f"DetailLoc={json.dumps(detail_location, ensure_ascii=False)}; "
+                        f"Contacts={contacts_json}"
+                    ),
+                }
 
-        rows_to_append.append(ordered)
-        existing_ids.add(award_id)
-        appended += 1
-        time.sleep(SLEEP_SECONDS)
+                ordered = [""] * len(hmap)
+                for header, col_index in hmap.items():
+                    ordered[col_index - 1] = values.get(header, "")
 
+                rows_to_append.append(ordered)
+                existing_ids.add(award_id)
+                appended += 1
+                time.sleep(SLEEP_SECONDS)
+
+            browser.close()
+
+        print(f"Recent fallback mode prepared rows: {len(rows_to_append)}")
+
+    # -------------------------
+    # Write to Google Sheet
+    # -------------------------
     if rows_to_append:
         ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
         print(f"✅ Appended {len(rows_to_append)} rows into {TAB_NAME}.")
     else:
-        print("No new rows appended (deduped or empty).")
+        print("No new rows appended (deduped / filtered / empty).")
 
-    print(f"Detail pages scraped: {detail_used} (cap={DETAIL_CAP})")
     print("Done.")
 
 
