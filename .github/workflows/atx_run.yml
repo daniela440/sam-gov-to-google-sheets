@@ -1,14 +1,13 @@
-name: ATX - Pull Issued Construction Permits into Google Sheet
+name: TX - Enrich Contractor Websites (10/day)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 7 * * 1"  # Mondays 07:00 UTC
+    - cron: "0 7 * * *"  # daily 07:00 UTC
 
 jobs:
-  atx-run:
+  tx-enrich:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -22,22 +21,25 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install requests
 
-      - name: Run TX pipeline (Austin Open Data)
+      - name: Enrich websites (TX)
         env:
           ATX_GOOGLE_CREDENTIALS_JSON: ${{ secrets.ATX_GOOGLE_CREDENTIALS_JSON }}
-
           TX_SHEET_ID: 1uXC-sW0xnJe1erIbuEYFM7R6cyeq7NFWPCfWCjEr8Ug
           TX_TAB_NAME: Awards_Raw_TX
 
-          TX_ISSUED_SINCE: "2025-12-15"
-          TX_WORK_CLASS_REQUIRED: "NEW"
+          # column mapping
+          TX_COL_COMPANY: "B"
+          TX_COL_CONTACT: "C"
+          TX_COL_ADDRESS: "D"
+          TX_COL_CITY: "E"
+          TX_COL_PHONE: "F"
+          TX_COL_WEBSITE: "T"
 
-          TX_MAX_NEW: "2000"
-          TX_SLEEP_SECONDS: "0.05"
-          TX_DATASET_ID: "3syk-w9eu"
-
-          TX_ENRICH_WEBSITE: "true"
-          TX_WEBSITE_LOOKUP_CAP: "400"
+          # limit
+          TX_MAX_ENRICH: "10"
+          TX_SLEEP_SECONDS: "2.0"
+          TX_HTTP_TIMEOUT: "25"
         run: |
           python scripts/tx/tx_run.py
