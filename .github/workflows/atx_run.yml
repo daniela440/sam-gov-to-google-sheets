@@ -35,7 +35,7 @@ jobs:
           TX_COL_ADDRESS: "D"
           TX_COL_CITY: "E"
           TX_COL_PHONE: "F"
-          TX_COL_WEBSITE: "T"
+          TX_COL_WEBSITE: "G"
 
           # limit
           TX_MAX_ENRICH: "10"
