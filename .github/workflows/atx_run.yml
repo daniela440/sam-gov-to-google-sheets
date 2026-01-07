@@ -6,7 +6,7 @@ on:
     - cron: "0 7 * * 1"  # Mondays 07:00 UTC
 
 jobs:
-  la-run:
+  atx-run:
     runs-on: ubuntu-latest
 
     steps:
@@ -22,28 +22,23 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install playwright
-          python -m playwright install --with-deps chromium
 
-      - name: Run CA pipeline (CEQAnet)
+      - name: Run ATX pipeline (Austin Open Data / Socrata)
         env:
-          LA_GOOGLE_CREDENTIALS_JSON: ${{ secrets.LA_GOOGLE_CREDENTIALS_JSON }}
+          # Google credentials
+          ATX_GOOGLE_CREDENTIALS_JSON: ${{ secrets.ATX_GOOGLE_CREDENTIALS_JSON }}
 
-          # Sheet destination
-          LA_SHEET_ID: 1uXC-sW0xnJe1erIbuEYFM7R6cyeq7NFWPCfWCjEr8Ug
-          LA_TAB_NAME: Awards_Raw_LA
+          # Google Sheet destination
+          ATX_SHEET_ID: 1uXC-sW0xnJe1erIbuEYFM7R6cyeq7NFWPCfWCjEr8Ug
+          ATX_TAB_NAME: Awards_Raw_TX
 
-          # Output controls
-          LA_MAX_NEW: "2000"
-          LA_SLEEP_SECONDS: "0.05"
+          # Pull controls
+          ATX_SINCE_DATE: "2025-12-15"
+          ATX_MAX_NEW: "2000"
+          ATX_SLEEP_SECONDS: "0.05"
+
+          # Dataset (Austin Open Data – Issued Construction Permits)
+          ATX_DATASET_ID: "3syk-w9eu"
+
         run: |
-          python scripts/la/la_run.py
-
-      - name: Upload CEQAnet debug screenshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ceqanet-debug
-          path: |
-            **/ceqanet_debug_*.png
-            **/ceqanet_debug_*.html
+          python scripts/atx/atx_run.py
