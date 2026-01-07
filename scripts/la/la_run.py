@@ -248,78 +248,128 @@ def _open_advanced_search(page, timeout_ms: int = 60_000) -> None:
         raise RuntimeError("Not on Advanced Search form. Saved ceqanet_debug_not_on_advanced.png")
 
 
-def ceqanet_download_csv_for_range_and_doc_type(
-    start_date_ddmmYYYY: str,
-    end_date_ddmmYYYY: str,
-    doc_type: str,
-    timeout_ms: int = 180_000
-) -> Tuple[bytes, str]:
+def _dismiss_banners(page) -> None:
     """
-    Runs Advanced Search for date range + doc type, downloads CSV.
-    Returns (csv_bytes, results_page_url).
+    Best-effort click away cookie/consent banners that can block nav clicks in headless mode.
+    Safe to call repeatedly.
     """
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(accept_downloads=True)
-        page = context.new_page()
-
-        _open_advanced_search(page, timeout_ms=timeout_ms)
-        page.wait_for_timeout(600)
-
-        # Fill dates using row text (matches screenshot labels exactly)
-        ok_start = _fill_input_by_row_text(page, "Start Range", start_date_ddmmYYYY)
-        ok_end   = _fill_input_by_row_text(page, "End Range", end_date_ddmmYYYY)
-
-        if not ok_start or not ok_end:
-            page.screenshot(path="ceqanet_debug_date_fill_failed.png", full_page=True)
-            raise RuntimeError("Could not fill Start/End Range. Saved ceqanet_debug_date_fill_failed.png")
-
-        # Document Type dropdown
-        ok_doc = _select_by_row_text(page, "Document Type", doc_type)
-        if not ok_doc:
-            page.screenshot(path="ceqanet_debug_doc_type_select_failed.png", full_page=True)
-            raise RuntimeError(f"Could not select Document Type={doc_type}. Saved ceqanet_debug_doc_type_select_failed.png")
-
-        # Click Get Results (there are two buttons; click the first visible)
-        clicked = _click_first(page, [
-            "button:has-text('Get Results')",
-            "input[value='Get Results']",
-            "text=Get Results",
-        ], timeout_ms=15_000)
-
-        if not clicked:
-            page.screenshot(path="ceqanet_debug_no_get_results.png", full_page=True)
-            raise RuntimeError("Could not click Get Results. Saved ceqanet_debug_no_get_results.png")
-
-        # Wait for results page to show download control
+    candidates = [
+        "button:has-text('Accept')",
+        "button:has-text('I Accept')",
+        "button:has-text('Agree')",
+        "button:has-text('I Agree')",
+        "button:has-text('OK')",
+        "button:has-text('Got it')",
+        "text=Accept All",
+        "text=I Agree",
+        "text=OK",
+        "button[aria-label*='accept' i]",
+        "button[aria-label*='agree' i]",
+    ]
+    for sel in candidates:
         try:
-            page.wait_for_selector("text=Download CSV", timeout=45_000)
-        except PWTimeoutError:
-            page.screenshot(path="ceqanet_debug_results_no_download.png", full_page=True)
-            raise RuntimeError("Results loaded but no Download CSV found. Saved ceqanet_debug_results_no_download.png")
+            loc = page.locator(sel).first
+            if loc.is_visible(timeout=800):
+                loc.click(timeout=1500, force=True)
+                page.wait_for_timeout(400)
+        except Exception:
+            pass
 
-        # Download CSV
+
+def _is_on_advanced_form(page) -> bool:
+    """
+    Stronger check than "Get Results": confirm the form has the expected rows/controls.
+    """
+    try:
+        # These are the exact row labels from your screenshot
+        if page.locator("text=Start Range").first.is_visible(timeout=1200) and \
+           page.locator("text=End Range").first.is_visible(timeout=1200) and \
+           page.locator("text=Document Type").first.is_visible(timeout=1200):
+            return True
+    except Exception:
+        pass
+
+    # Fallback: look for date placeholders shown in screenshot ("dd. mm. yyyy.")
+    try:
+        if page.locator("input[placeholder*='dd' i]").count() >= 2:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _open_advanced_search(page, timeout_ms: int = 60_000) -> None:
+    """
+    Robust navigation to Advanced Search:
+      1) Direct URL attempts (preferred)
+      2) /Search/Recent fallback
+      3) Click-based fallback using href contains AdvancedSearch
+    """
+    advanced_url_candidates = [
+        "https://ceqanet.lci.ca.gov/Search/AdvancedSearch",
+        "https://ceqanet.lci.ca.gov/search/advancedsearch",
+        "https://ceqanet.lci.ca.gov/Search/Advanced",
+        "https://ceqanet.lci.ca.gov/search/advanced",
+        "https://ceqanet.lci.ca.gov/AdvancedSearch",
+        "https://ceqanet.lci.ca.gov/advancedsearch",
+    ]
+
+    def goto_and_check(url: str) -> bool:
         try:
-            with page.expect_download(timeout=90_000) as dl_info:
-                ok_dl = _click_first(page, [
-                    "text=Download CSV",
-                    "button:has-text('Download CSV')",
-                    "a:has-text('Download CSV')",
-                    "a[href*='csv' i]",
-                ], timeout_ms=15_000)
-                if not ok_dl:
-                    page.screenshot(path="ceqanet_debug_no_download_csv.png", full_page=True)
-                    raise RuntimeError("Could not click Download CSV.")
-            download = dl_info.value
-            path = download.path()
-            csv_bytes = open(path, "rb").read()
-        except Exception as e:
-            page.screenshot(path="ceqanet_debug_download_failed.png", full_page=True)
-            raise RuntimeError(f"CSV download failed. Saved ceqanet_debug_download_failed.png. Error={e}")
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(800)
+            _dismiss_banners(page)
+            page.wait_for_timeout(300)
+            return _is_on_advanced_form(page)
+        except Exception:
+            return False
 
-        results_url = page.url
-        browser.close()
-        return csv_bytes, results_url
+    # 1) Try direct Advanced Search URLs
+    for u in advanced_url_candidates:
+        if goto_and_check(u):
+            return
+
+    # 2) Fallback: go to Recent and try to navigate from there
+    recent_url = "https://ceqanet.lci.ca.gov/Search/Recent"
+    page.goto(recent_url, wait_until="domcontentloaded", timeout=timeout_ms)
+    page.wait_for_timeout(1000)
+    _dismiss_banners(page)
+    page.wait_for_timeout(400)
+
+    # Sometimes the nav differs on /Search/Recent and exposes Advanced Search
+    # Try role-based first, then href-based.
+    try:
+        page.get_by_role("link", name="Advanced Search", exact=False).click(timeout=6_000, force=True)
+        page.wait_for_timeout(1000)
+        _dismiss_banners(page)
+        if _is_on_advanced_form(page):
+            return
+    except Exception:
+        pass
+
+    # 3) Click by href contains "AdvancedSearch" (works even if link text differs)
+    clicked = _click_first(page, [
+        "a[href*='AdvancedSearch' i]",
+        "a[href*='advancedsearch' i]",
+        "a[href*='Search/Advanced' i]",
+        "a:has-text('Advanced')",
+        "text=Advanced Search",
+    ], timeout_ms=10_000)
+
+    if clicked:
+        page.wait_for_timeout(1200)
+        _dismiss_banners(page)
+        if _is_on_advanced_form(page):
+            return
+
+    # Final: attempt direct again after recent (sometimes session/cookies matter)
+    for u in advanced_url_candidates:
+        if goto_and_check(u):
+            return
+
+    page.screenshot(path="ceqanet_debug_no_advanced.png", full_page=True)
+    raise RuntimeError("Could not open Advanced Search. Saved ceqanet_debug_no_advanced.png")
 
 
 # =============================
