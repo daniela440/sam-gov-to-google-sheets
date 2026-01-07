@@ -544,6 +544,76 @@ def pick_preferred_contact(contacts: List[Dict[str, str]]) -> Optional[Dict[str,
             return c
     return contacts[0]
 
+def ceqanet_download_csv_for_range_and_doc_type(
+    start_date_ddmmYYYY: str,
+    end_date_ddmmYYYY: str,
+    doc_type: str,
+    timeout_ms: int = 180_000
+) -> Tuple[bytes, str]:
+    """
+    Runs Advanced Search for date range + doc type, downloads CSV.
+    Returns (csv_bytes, results_page_url).
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(accept_downloads=True)
+        page = context.new_page()
+
+        _open_advanced_search(page, timeout_ms=timeout_ms)
+        page.wait_for_timeout(600)
+
+        # Fill dates using the row labels (matches screenshot)
+        ok_start = _fill_input_by_row_text(page, "Start Range", start_date_ddmmYYYY)
+        ok_end   = _fill_input_by_row_text(page, "End Range", end_date_ddmmYYYY)
+        if not ok_start or not ok_end:
+            page.screenshot(path="ceqanet_debug_date_fill_failed.png", full_page=True)
+            raise RuntimeError("Could not fill Start/End Range. Saved ceqanet_debug_date_fill_failed.png")
+
+        # Select document type (NOP / NOE)
+        ok_doc = _select_by_row_text(page, "Document Type", doc_type)
+        if not ok_doc:
+            page.screenshot(path="ceqanet_debug_doc_type_select_failed.png", full_page=True)
+            raise RuntimeError(f"Could not select Document Type={doc_type}. Saved ceqanet_debug_doc_type_select_failed.png")
+
+        # Click Get Results
+        clicked = _click_first(page, [
+            "button:has-text('Get Results')",
+            "input[value='Get Results']",
+            "text=Get Results",
+        ], timeout_ms=15_000)
+
+        if not clicked:
+            page.screenshot(path="ceqanet_debug_no_get_results.png", full_page=True)
+            raise RuntimeError("Could not click Get Results. Saved ceqanet_debug_no_get_results.png")
+
+        # Wait for results page + download control
+        try:
+            page.wait_for_selector("text=Download CSV", timeout=45_000)
+        except PWTimeoutError:
+            page.screenshot(path="ceqanet_debug_results_no_download.png", full_page=True)
+            raise RuntimeError("Results loaded but no Download CSV found. Saved ceqanet_debug_results_no_download.png")
+
+        # Download CSV
+        try:
+            with page.expect_download(timeout=90_000) as dl_info:
+                ok_dl = _click_first(page, [
+                    "text=Download CSV",
+                    "button:has-text('Download CSV')",
+                    "a:has-text('Download CSV')",
+                    "a[href*='csv' i]",
+                ], timeout_ms=15_000)
+                if not ok_dl:
+                    page.screenshot(path="ceqanet_debug_no_download_csv.png", full_page=True)
+                    raise RuntimeError("Could not click Download CSV.")
+            download = dl_info.value
+            csv_bytes = open(download.path(), "rb").read()
+        except Exception as e:
+            page.screenshot(path="ceqanet_debug_download_failed.png", full_page=True)
+            raise RuntimeError(f"CSV download failed. Saved ceqanet_debug_download_failed.png. Error={e}")
+
+        results_url = page.url
+        browser.close()
+        return csv_bytes, results_url
 
 # =============================
 # Main
