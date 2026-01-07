@@ -1,90 +1,174 @@
 import os
-import json
+import re
 import time
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+import json
+import urllib.parse
+from typing import Optional, List, Tuple
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
 
-# =============================
-# CONFIG
-# =============================
+# =========================
+# CONFIG (env-driven)
+# =========================
 
-SOCRATA_DOMAIN = "data.austintexas.gov"
-DATASET_ID = os.environ.get("TX_DATASET_ID", "3syk-w9eu")
-SOCRATA_BASE = f"https://{SOCRATA_DOMAIN}/resource/{DATASET_ID}.json"
+CREDS_ENV = "ATX_GOOGLE_CREDENTIALS_JSON"
 
-# Filters
-ISSUED_SINCE = os.environ.get("TX_ISSUED_SINCE", "2025-12-15")  # YYYY-MM-DD
-WORK_CLASS_REQUIRED = os.environ.get("TX_WORK_CLASS_REQUIRED", "NEW")  # we only want NEW work class
-
-# Google Sheet
 SHEET_ID = os.environ.get("TX_SHEET_ID")
 TAB_NAME = os.environ.get("TX_TAB_NAME", "Awards_Raw_TX")
-CREDS_ENV = "ATX_GOOGLE_CREDENTIALS_JSON"  # you said the secret is already named this
 
-# Runtime controls
-MAX_NEW = int(os.environ.get("TX_MAX_NEW", "2000"))
-SLEEP_SECONDS = float(os.environ.get("TX_SLEEP_SECONDS", "0.05"))
-PAGE_SIZE = int(os.environ.get("TX_PAGE_SIZE", "5000"))
-HTTP_TIMEOUT = int(os.environ.get("TX_HTTP_TIMEOUT", "45"))
+# Column letters (1-indexed in gspread update)
+# We LOOK at these columns:
+COL_COMPANY = os.environ.get("TX_COL_COMPANY", "B")
+COL_CONTACT = os.environ.get("TX_COL_CONTACT", "C")  # optional
+COL_ADDRESS = os.environ.get("TX_COL_ADDRESS", "D")
+COL_CITY    = os.environ.get("TX_COL_CITY", "E")
+COL_PHONE   = os.environ.get("TX_COL_PHONE", "F")
 
-# Optional Socrata app token (helps avoid throttling; not required)
-SOCRATA_APP_TOKEN = os.environ.get("TX_SOCRATA_APP_TOKEN", "").strip()
+# We WRITE the website to this column:
+COL_WEBSITE = os.environ.get("TX_COL_WEBSITE", "T")
 
-# Website enrichment
-ENRICH_WEBSITE = os.environ.get("TX_ENRICH_WEBSITE", "true").lower() == "true"
-WEBSITE_LOOKUP_CAP = int(os.environ.get("TX_WEBSITE_LOOKUP_CAP", "400"))
+# Limit how many websites we enrich per run/day
+MAX_ENRICH = int(os.environ.get("TX_MAX_ENRICH", "10"))
 
+# DuckDuckGo HTML endpoint (simple)
+DDG_URL = "https://duckduckgo.com/html/"
 
-# =============================
-# HELPERS
-# =============================
+# Throttling
+SLEEP_BETWEEN = float(os.environ.get("TX_SLEEP_SECONDS", "2.0"))
+HTTP_TIMEOUT = int(os.environ.get("TX_HTTP_TIMEOUT", "25"))
 
-REQUIRED_HEADERS = [
-    "Contractor Trade",
-    "Contractor Company Name",
-    "Contractor Full Name",
-    "Contractor Address",
-    "Contractor City",
-    "Contractor Phone",
-    "Contractor Website",
-    "Issued Date",
-    "Expiration Date",
-    "Permit Class Mapped",
-    "Work Class",
-    "Project Name",
-    "Description",
-    "Housing Units",
-    "Total Job Valuation",
-]
-
-
-def normalize_str(x) -> str:
-    return str(x).strip() if x is not None else ""
+# Exclude obvious non-company destinations
+BAD_DOMAINS = {
+    "facebook.com", "m.facebook.com",
+    "instagram.com",
+    "linkedin.com",
+    "x.com", "twitter.com",
+    "yelp.com",
+    "bbb.org",
+    "mapquest.com",
+    "yellowpages.com",
+    "angi.com", "homeadvisor.com",
+    "opencorporates.com",
+    "buzzfile.com",
+    "dnb.com",
+}
 
 
-def utc_now_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+# =========================
+# Helpers
+# =========================
 
+def col_to_index(col_letter: str) -> int:
+    """Convert Excel column letter(s) to 1-based index."""
+    col_letter = col_letter.strip().upper()
+    n = 0
+    for ch in col_letter:
+        if "A" <= ch <= "Z":
+            n = n * 26 + (ord(ch) - ord("A") + 1)
+    return n
 
-def parse_iso_date_any(s: str) -> str:
+def norm(s: Optional[str]) -> str:
+    return (s or "").strip()
+
+def normalize_phone(phone: str) -> str:
+    digits = re.sub(r"\D+", "", phone or "")
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return digits
+
+def root_domain(url: str) -> str:
+    url = url.strip()
+    url = re.sub(r"^https?://", "", url, flags=re.I)
+    url = url.split("/")[0]
+    return url.lower()
+
+def is_bad_domain(url: str) -> bool:
+    d = root_domain(url)
+    if not d:
+        return True
+    # strip leading www.
+    if d.startswith("www."):
+        d = d[4:]
+    # exact or suffix match
+    return any(d == bd or d.endswith("." + bd) for bd in BAD_DOMAINS)
+
+def choose_best_url(urls: List[str], company: str) -> Optional[str]:
+    """Pick a good candidate: prefer non-bad domains, prefer shorter/homepage-like."""
+    cleaned = []
+    for u in urls:
+        u = norm(u)
+        if not u:
+            continue
+        if not u.lower().startswith("http"):
+            continue
+        if is_bad_domain(u):
+            continue
+        cleaned.append(u)
+
+    if not cleaned:
+        return None
+
+    # Prefer homepage-ish URLs (no deep paths), then shortest
+    cleaned.sort(key=lambda u: (u.count("/"), len(u)))
+    return cleaned[0]
+
+def build_query(company: str, contact: str, address: str, city: str, phone: str) -> str:
+    parts = [company]
+    if contact:
+        parts.append(contact)
+    if city:
+        parts.append(city)
+    # phone is strong when present
+    ph = normalize_phone(phone)
+    if ph:
+        parts.append(ph)
+    # address can help, but keep it light
+    if address:
+        # keep first ~40 chars to avoid overly long query
+        parts.append(address[:40])
+    return " ".join([p for p in parts if p]).strip()
+
+def ddg_search_urls(query: str, timeout: int = 25) -> List[str]:
     """
-    Normalize Socrata timestamps to YYYY-MM-DD when possible.
-    Keeps original if parsing fails.
+    Uses DuckDuckGo HTML results (basic).
+    Returns list of result URLs (best-effort).
     """
-    s = normalize_str(s)
-    if not s:
-        return ""
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d")
-    except Exception:
-        return s
+    params = {"q": query}
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        )
+    }
+    r = requests.get(DDG_URL, params=params, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    html = r.text
 
+    # DDG /html/ typically uses links like: <a class="result__a" href="...">
+    urls = re.findall(r'class="result__a"[^>]+href="([^"]+)"', html)
+    # Some are redirect links; decode if needed
+    out = []
+    for u in urls:
+        u = u.replace("&amp;", "&")
+        # If DDG uses "/l/?kh=-1&uddg=<ENCODED>"
+        m = re.search(r"[?&]uddg=([^&]+)", u)
+        if m:
+            try:
+                decoded = urllib.parse.unquote(m.group(1))
+                out.append(decoded)
+                continue
+            except Exception:
+                pass
+        out.append(u)
+    return out
+
+
+# =========================
+# Google Sheets
+# =========================
 
 def get_gspread_client():
     creds_json = os.environ.get(CREDS_ENV)
@@ -100,306 +184,89 @@ def get_gspread_client():
     return gspread.authorize(credentials)
 
 
-def header_map(ws) -> dict:
-    headers = ws.row_values(1)
-    if not headers:
-        raise RuntimeError("Row 1 headers are empty.")
-    # Exact match mapping
-    return {h: i + 1 for i, h in enumerate(headers)}
-
-
-def ensure_required_headers_present(ws) -> None:
-    headers = ws.row_values(1)
-    missing = [h for h in REQUIRED_HEADERS if h not in headers]
-    if missing:
-        raise RuntimeError(
-            "Your sheet header row is missing required columns: "
-            + ", ".join(missing)
-            + ".\nFix row 1 to match exactly."
-        )
-
-
-def load_existing_keys(ws) -> set:
-    """
-    Since you removed Award ID and other prior identifiers,
-    we dedupe using a stable key stored in the Note/hidden? column is gone.
-    Therefore we dedupe by a composite of:
-      Issued Date + Contractor Company Name + Project Name + Total Job Valuation
-    (good enough to prevent most duplicates in sheet)
-    """
-    # Build dedupe keys from existing rows (read relevant columns by header).
-    headers = ws.row_values(1)
-    h = {name: idx for idx, name in enumerate(headers)}
-
-    def col(name: str) -> int:
-        return h.get(name, -1)
-
-    idx_issued = col("Issued Date")
-    idx_company = col("Contractor Company Name")
-    idx_project = col("Project Name")
-    idx_val = col("Total Job Valuation")
-
-    # If any are missing, ensure_required_headers_present should have caught it.
-    vals = ws.get_all_values()
-    keys = set()
-    for row in vals[1:]:
-        issued = row[idx_issued] if idx_issued >= 0 and idx_issued < len(row) else ""
-        company = row[idx_company] if idx_company >= 0 and idx_company < len(row) else ""
-        project = row[idx_project] if idx_project >= 0 and idx_project < len(row) else ""
-        val = row[idx_val] if idx_val >= 0 and idx_val < len(row) else ""
-        k = f"{issued}|{company}|{project}|{val}".strip()
-        if k and k != "|||":
-            keys.add(k)
-    return keys
-
-
-def pick(d: Dict[str, object], keys: List[str]) -> str:
-    for k in keys:
-        if k in d:
-            v = normalize_str(d.get(k))
-            if v:
-                return v
-    return ""
-
-
-def socrata_headers() -> Dict[str, str]:
-    h = {"Accept": "application/json"}
-    if SOCRATA_APP_TOKEN:
-        h["X-App-Token"] = SOCRATA_APP_TOKEN
-    return h
-
-
-def socrata_get(params: Dict[str, str]) -> List[Dict[str, object]]:
-    r = requests.get(SOCRATA_BASE, params=params, headers=socrata_headers(), timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    if not isinstance(data, list):
-        return []
-    return data
-
-
-def ddg_company_website(company_name: str, city: str = "", address: str = "", phone: str = "") -> str:
-    """
-    Lightweight website discovery using DuckDuckGo HTML results.
-    Query uses company name + (city/address) + phone if present to disambiguate.
-    """
-    company_name = normalize_str(company_name)
-    if not company_name:
-        return ""
-
-    parts = [company_name]
-    if city:
-        parts.append(city)
-    if address:
-        parts.append(address)
-    if phone:
-        parts.append(phone)
-    parts.append("website")
-    q = " ".join([p for p in parts if p])
-
-    url = "https://duckduckgo.com/html/"
-    try:
-        resp = requests.post(url, data={"q": q}, timeout=HTTP_TIMEOUT)
-        if resp.status_code != 200:
-            return ""
-
-        html = resp.text
-
-        # Extract first result URL
-        marker = 'class="result__a" href="'
-        idx = html.find(marker)
-        if idx == -1:
-            return ""
-        start = idx + len(marker)
-        end = html.find('"', start)
-        if end == -1:
-            return ""
-        found = html[start:end].strip()
-
-        # Filter obvious non-sites, try a second result if needed
-        bad = (
-            "linkedin.com", "facebook.com", "instagram.com", "yelp.com", "mapquest.com",
-            "opencorporates.com", "bloomberg.com", "dnb.com", "zoominfo.com", "buzzfile.com",
-            "chamberofcommerce.com", "yellowpages.com", "bbb.org"
-        )
-
-        def is_bad(u: str) -> bool:
-            ul = u.lower()
-            return any(b in ul for b in bad)
-
-        if not found.startswith("http"):
-            return ""
-        if is_bad(found):
-            idx2 = html.find(marker, end)
-            if idx2 != -1:
-                start2 = idx2 + len(marker)
-                end2 = html.find('"', start2)
-                if end2 != -1:
-                    found2 = html[start2:end2].strip()
-                    if found2.startswith("http") and not is_bad(found2):
-                        return found2
-            return ""
-
-        return found
-    except Exception:
-        return ""
-
-
-# =============================
-# CORE LOGIC
-# =============================
-
-def build_where_clause() -> str:
-    """
-    Filter:
-      issue_date >= ISSUED_SINCE
-      work_class == NEW (case-insensitive)
-    """
-    since_ts = f"{ISSUED_SINCE}T00:00:00.000"
-    return f"issue_date >= '{since_ts}' AND upper(work_class) = '{WORK_CLASS_REQUIRED.upper()}'"
-
-
-def fetch_permits() -> List[Dict[str, object]]:
-    where = build_where_clause()
-    print(f"TX | Fetching permits where: {where}")
-
-    out: List[Dict[str, object]] = []
-    offset = 0
-
-    while True:
-        params = {
-            "$where": where,
-            "$limit": str(PAGE_SIZE),
-            "$offset": str(offset),
-            "$order": "issue_date ASC, permit_number ASC",
-        }
-        batch = socrata_get(params)
-        if not batch:
-            break
-
-        out.extend(batch)
-        offset += len(batch)
-        print(f"TX | fetched {len(batch)} (total={len(out)})")
-
-        # Safety cap
-        if len(out) >= MAX_NEW * 10:
-            print("TX | safety stop: pulled enough raw records for this run.")
-            break
-
-        time.sleep(SLEEP_SECONDS)
-
-    return out
-
-
 def main():
     if not SHEET_ID:
         raise RuntimeError("Missing TX_SHEET_ID env var")
-    if not TAB_NAME:
-        raise RuntimeError("Missing TX_TAB_NAME env var")
 
     gc = get_gspread_client()
     sh = gc.open_by_key(SHEET_ID)
     ws = sh.worksheet(TAB_NAME)
 
-    ensure_required_headers_present(ws)
-    hmap = header_map(ws)
-    existing_keys = load_existing_keys(ws)
+    # Column indexes (1-based)
+    idx_company = col_to_index(COL_COMPANY)
+    idx_contact = col_to_index(COL_CONTACT)
+    idx_address = col_to_index(COL_ADDRESS)
+    idx_city    = col_to_index(COL_CITY)
+    idx_phone   = col_to_index(COL_PHONE)
+    idx_website = col_to_index(COL_WEBSITE)
 
-    rows = fetch_permits()
-    print(f"TX | total raw rows fetched: {len(rows)}")
-    if not rows:
-        print("TX | No rows returned for criteria.")
+    # Read all values once (efficient enough for typical sheet sizes)
+    all_values = ws.get_all_values()
+    if len(all_values) < 2:
+        print("Sheet has no data rows.")
         return
 
-    rows_to_append: List[List[str]] = []
-    appended = 0
-    website_lookups = 0
+    # Build candidate rows: website empty in column T
+    # all_values is 0-based lists; row 1 is headers
+    candidates: List[Tuple[int, str, str, str, str, str]] = []
+    for r_i in range(1, len(all_values)):  # start at row 2 (index 1)
+        row = all_values[r_i]
 
-    for r in rows:
-        if appended >= MAX_NEW:
-            break
+        # Safely read columns (may be shorter than expected)
+        def cell(idx_1based: int) -> str:
+            j = idx_1based - 1
+            return norm(row[j]) if j < len(row) else ""
 
-        # ---- Field extraction (robust picks: dataset names can vary slightly) ----
-        # Required/requested fields
-        permit_class_mapped = pick(r, ["permit_class_mapped", "permit_class_mapping"])
-        work_class = pick(r, ["work_class"])
-        project_name = pick(r, ["project_name", "permit_location", "project", "location"])
-        description = pick(r, ["description", "work_description", "description_of_work"])
-
-        issued_raw = pick(r, ["issue_date", "issued_date"])
-        exp_raw = pick(r, ["expiration_date", "expires_date", "exp_date", "expiration"])
-
-        issued_date = parse_iso_date_any(issued_raw)
-        expiration_date = parse_iso_date_any(exp_raw)
-
-        housing_units = pick(r, ["housing_units", "units", "unit_count"])
-        total_job_valuation = pick(r, ["total_job_valuation", "valuation", "job_valuation", "declared_valuation"])
-
-        contractor_trade = pick(r, ["contractor_trade", "trade"])
-        contractor_company = pick(r, ["contractor_company_name", "contractor_company", "company_name"])
-        contractor_full_name = pick(r, ["contractor_full_name", "contractor_name", "full_name", "name"])
-        contractor_phone = pick(r, ["contractor_phone", "phone"])
-        contractor_address = pick(r, ["contractor_address", "contractor_address1", "contractor_address_1", "contractor_address2", "contractor_address_2"])
-        contractor_city = pick(r, ["contractor_city", "city"])
-
-        # ---- Dedupe key ----
-        dedupe_key = f"{issued_date}|{contractor_company}|{project_name}|{total_job_valuation}".strip()
-        if dedupe_key in existing_keys:
+        website = cell(idx_website)
+        if website:
             continue
 
-        # ---- Website enrichment ----
-        contractor_website = ""
-        if ENRICH_WEBSITE and contractor_company and website_lookups < WEBSITE_LOOKUP_CAP:
-            contractor_website = ddg_company_website(
-                contractor_company,
-                city=contractor_city,
-                address=contractor_address,
-                phone=contractor_phone
-            )
-            website_lookups += 1
-            time.sleep(SLEEP_SECONDS)
+        company = cell(idx_company)
+        if not company:
+            continue
 
-        # ---- Build row matching the sheet headers exactly ----
-        row_values = {
-            "Contractor Trade": contractor_trade,
-            "Contractor Company Name": contractor_company,
-            "Contractor Full Name": contractor_full_name,
-            "Contractor Address": contractor_address,
-            "Contractor City": contractor_city,
-            "Contractor Phone": contractor_phone,
-            "Contractor Website": contractor_website,
-            "Issued Date": issued_date,
-            "Expiration Date": expiration_date,
-            "Permit Class Mapped": permit_class_mapped,
-            "Work Class": work_class,
-            "Project Name": project_name,
-            "Description": description,
-            "Housing Units": housing_units,
-            "Total Job Valuation": total_job_valuation,
-        }
+        contact = cell(idx_contact)
+        address = cell(idx_address)
+        city    = cell(idx_city)
+        phone   = cell(idx_phone)
 
-        # Order columns according to header row in the sheet
-        ordered = [""] * len(hmap)
-        for header, col_index in hmap.items():
-            if header in row_values:
-                ordered[col_index - 1] = row_values.get(header, "")
-            else:
-                # If sheet has any extra columns beyond the required set, leave blank.
-                ordered[col_index - 1] = ""
+        candidates.append((r_i + 1, company, contact, address, city, phone))  # store real sheet row number
 
-        rows_to_append.append(ordered)
-        existing_keys.add(dedupe_key)
-        appended += 1
+    if not candidates:
+        print("No rows need website enrichment (column T already filled).")
+        return
 
-        time.sleep(SLEEP_SECONDS)
+    print(f"Rows needing website (blank {COL_WEBSITE}): {len(candidates)}")
+    to_process = candidates[:MAX_ENRICH]
+    print(f"Processing up to {MAX_ENRICH} rows this run: {len(to_process)}")
 
-    if rows_to_append:
-        ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
-        print(f"✅ Appended {len(rows_to_append)} rows into {TAB_NAME}.")
-    else:
-        print("No new rows appended (deduped or empty).")
+    updates = []
+    processed = 0
 
-    print(f"TX | website lookups used: {website_lookups} (cap={WEBSITE_LOOKUP_CAP})")
+    for sheet_row_num, company, contact, address, city, phone in to_process:
+        query = build_query(company, contact, address, city, phone)
+        print(f"[{processed+1}/{len(to_process)}] Row {sheet_row_num} | query={query}")
+
+        website = ""
+        try:
+            urls = ddg_search_urls(query, timeout=HTTP_TIMEOUT)
+            website = choose_best_url(urls, company) or ""
+        except Exception as e:
+            print(f"  ⚠️ search failed: {e}")
+
+        updates.append((sheet_row_num, website))
+        processed += 1
+        time.sleep(SLEEP_BETWEEN)
+
+    # Apply updates (batch style: individual cells, but grouped)
+    if updates:
+        cell_list = []
+        for row_num, website in updates:
+            # write into column T
+            cell_list.append(gspread.Cell(row_num, idx_website, website))
+        ws.update_cells(cell_list, value_input_option="USER_ENTERED")
+        print(f"✅ Updated {len(updates)} website cells in column {COL_WEBSITE}.")
+
     print("Done.")
 
 
