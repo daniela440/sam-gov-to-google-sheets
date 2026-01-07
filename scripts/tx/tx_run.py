@@ -28,7 +28,7 @@ COL_CITY    = os.environ.get("TX_COL_CITY", "E")
 COL_PHONE   = os.environ.get("TX_COL_PHONE", "F")
 
 # We WRITE the website to this column:
-COL_WEBSITE = os.environ.get("TX_COL_WEBSITE", "T")
+COL_WEBSITE = os.environ.get("TX_COL_WEBSITE", "G")
 
 # Limit how many websites we enrich per run/day
 MAX_ENRICH = int(os.environ.get("TX_MAX_ENRICH", "10"))
